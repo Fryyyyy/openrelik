@@ -14,7 +14,7 @@
 
 from fastapi import APIRouter
 
-from config import config
+from config import config, get_active_cloud_provider
 
 router = APIRouter()
 
@@ -29,4 +29,10 @@ def get_system_config():
         "text/csv",
         "text/json",
     ]
-    return {"active_llms": active_llms, "data_types": data_types}
+    active_cloud = get_active_cloud_provider()
+
+    return {
+        "active_llms": active_llms,
+        "data_types": data_types,
+        "active_cloud": active_cloud,
+    }
