@@ -1,0 +1,12 @@
+services:
+  openrelik-mcp-server:
+    image: ghcr.io/openrelik/openrelik-mcp-server:latest
+    restart: always
+    ports:
+      - 8081:8081
+    environment:
+      - OPENRELIK_API_URL=${OPENRELIK_API_URL}
+      - OPENRELIK_API_KEY=${OPENRELIK_API_KEY}
+      - MCP_TRANSPORT=http
+      - MCP_HTTP_HOST=0.0.0.0
+      - MCP_HTTP_PORT=7070
