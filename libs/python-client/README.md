@@ -9,7 +9,7 @@ This Python package provides a simple API client (`APIClient`) that automaticall
 ## Installation
 
    ```bash
-   pip install openrelik-api-client
+   pip install openrelik-python-client
    ```
 
 **Example:**
