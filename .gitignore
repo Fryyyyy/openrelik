@@ -1,0 +1,39 @@
+# The repository's .gitignore. Patterns without a slash match in every
+# directory, so keep them specific: a broad pattern such as lib/ would silently
+# ignore new files in server/src/lib/. Patterns for one component go under its
+# path here, or in a .gitignore in its directory (web/sunstone has one for the
+# front-end build). Files that are already tracked aren't affected.
+
+# Secrets and local configuration. Example files (.env.example, .env.sample,
+# settings_example.toml) stay tracked.
+.env
+.env.*
+!.env.example
+!.env.sample
+.envrc
+.pypirc
+settings.toml
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local development
+Tiltfile
+sql_app.db
+.idea/
+.vscode/
+.DS_Store
