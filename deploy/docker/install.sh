@@ -22,9 +22,15 @@ echo -e "\033[38;5;51m  ██  ██ ██     ██     ██ ███ �
 echo -e "\033[38;5;87m   ████  ██     ██████ ██  ██ ██  ██ ██████ ██████ ██ ██  ██\033[0m"
 echo ""
 
-# Version configuration
-RELEASES=("0.7.0" "0.6.0")
-LATEST_RELEASE="0.7.0"
+# Version configuration, newest first. RELEASES are released from the monorepo:
+# the tag v<release> holds the deployment files and the server together.
+# LEGACY_RELEASES predate the monorepo and install from the archived
+# openrelik-deploy and openrelik-server repositories.
+MONOREPO="openrelik/openrelik"
+RELEASES=()
+LEGACY_RELEASES=("0.7.0" "0.6.0")
+ALL_RELEASES=(${RELEASES[@]+"${RELEASES[@]}"} "${LEGACY_RELEASES[@]}")
+LATEST_RELEASE="${ALL_RELEASES[0]}"
 
 # Prompt user to select version
 echo -e "\033[1;34m  Select a version to install:\033[0m"
@@ -33,7 +39,7 @@ echo -e "    \033[1;37m2)\033[0m Bleeding edge (latest)"
 
 # Add other releases from the array to the prompt
 OTHER_RELEASES=()
-for release in "${RELEASES[@]}"; do
+for release in "${ALL_RELEASES[@]}"; do
   if [[ "$release" != "$LATEST_RELEASE" ]]; then
     OTHER_RELEASES+=("$release")
   fi
@@ -48,38 +54,42 @@ read -rp "  Enter your choice [1-$(( ${#OTHER_RELEASES[@]} + 2 ))] (default: 1):
 
 case "${version_choice}" in
   2)
-    OPENRELIK_SERVER_VERSION="latest"
-    CONFIG_ENV_FILE="config_latest.env"
-    COMPOSE_FILE="docker-compose_latest.yml"
-    SERVER_REF="main"
+    SELECTED_RELEASE="latest"
     echo -e "  \033[1;32m→ Installing bleeding edge version\033[0m\n"
     ;;
   1|"")
-    OPENRELIK_SERVER_VERSION="${LATEST_RELEASE}"
-    CONFIG_ENV_FILE="config_${LATEST_RELEASE}.env"
-    COMPOSE_FILE="docker-compose_${LATEST_RELEASE}.yml"
-    SERVER_REF="refs/tags/${LATEST_RELEASE}"
+    SELECTED_RELEASE="${LATEST_RELEASE}"
     echo -e "  \033[1;32m→ Installing release ${LATEST_RELEASE}\033[0m\n"
     ;;
   *)
     idx=$((version_choice - 3))
     if [[ "$version_choice" =~ ^[0-9]+$ ]] && [[ $idx -ge 0 && $idx -lt ${#OTHER_RELEASES[@]} ]]; then
       SELECTED_RELEASE="${OTHER_RELEASES[$idx]}"
-      OPENRELIK_SERVER_VERSION="${SELECTED_RELEASE}"
-      CONFIG_ENV_FILE="config_${SELECTED_RELEASE}.env"
-      COMPOSE_FILE="docker-compose_${SELECTED_RELEASE}.yml"
-      SERVER_REF="refs/tags/${SELECTED_RELEASE}"
-      echo -e "  \033[1;32m→ Installing release ${SELECTED_RELEASE}\033[0m\n"
     else
       # Default to latest release for any other input
-      OPENRELIK_SERVER_VERSION="${LATEST_RELEASE}"
-      CONFIG_ENV_FILE="config_${LATEST_RELEASE}.env"
-      COMPOSE_FILE="docker-compose_${LATEST_RELEASE}.yml"
-      SERVER_REF="refs/tags/${LATEST_RELEASE}"
-      echo -e "  \033[1;32m→ Installing release ${LATEST_RELEASE}\033[0m\n"
+      SELECTED_RELEASE="${LATEST_RELEASE}"
     fi
+    echo -e "  \033[1;32m→ Installing release ${SELECTED_RELEASE}\033[0m\n"
     ;;
 esac
+
+# Where to download the deployment files and server settings from.
+if [[ " ${LEGACY_RELEASES[*]} " == *" ${SELECTED_RELEASE} "* ]]; then
+  BASE_DEPLOY_URL="https://raw.githubusercontent.com/openrelik/openrelik-deploy/main/docker"
+  BASE_SERVER_URL="https://raw.githubusercontent.com/openrelik/openrelik-server/refs/tags/${SELECTED_RELEASE}"
+  CONFIG_ENV_FILE="config_${SELECTED_RELEASE}.env"
+  COMPOSE_FILE="docker-compose_${SELECTED_RELEASE}.yml"
+else
+  if [[ "${SELECTED_RELEASE}" == "latest" ]]; then
+    MONOREPO_REF="refs/heads/main"
+  else
+    MONOREPO_REF="refs/tags/v${SELECTED_RELEASE}"
+  fi
+  BASE_DEPLOY_URL="https://raw.githubusercontent.com/${MONOREPO}/${MONOREPO_REF}/deploy/docker"
+  BASE_SERVER_URL="https://raw.githubusercontent.com/${MONOREPO}/${MONOREPO_REF}/server"
+  CONFIG_ENV_FILE="config.env"
+  COMPOSE_FILE="docker-compose.yml"
+fi
 
 # Exit early if there already is an 'openrelik' directory
 if [ -d "openrelik" ]; then
@@ -133,8 +143,6 @@ replace_in_file() {
 
 # Setup variables
 echo -e "\033[1;34m[1/8] Setting up variables...\033[0m\c"
-BASE_DEPLOY_URL="https://raw.githubusercontent.com/openrelik/openrelik-deploy/main/docker"
-BASE_SERVER_URL="https://raw.githubusercontent.com/openrelik/openrelik-server/${SERVER_REF}"
 STORAGE_PATH="\/usr\/share\/openrelik\/data\/artifacts"
 POSTGRES_USER="openrelik"
 POSTGRES_PASSWORD="$(generate_random_string)"
