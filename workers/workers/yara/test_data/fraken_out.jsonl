@@ -1,0 +1,4 @@
+[]
+[{"ImagePath":"/usr/share/openrelik/data/artifacts/test_input.txt","SHA256":"2aab6dc411baf0605a1b284128323709e38b0f1d147d09cfbc24997acb9527eb","Signature":"Detect_Project_Alpha","Description":"Detects files associated with Project Alpha","Reference":"","Score":50},{"ImagePath":"/usr/share/openrelik/data/artifacts/test_input.txt","SHA256":"2aab6dc411baf0605a1b284128323709e38b0f1d147d09cfbc24997acb9527eb","Signature":"Detect_Malicious_URL","Description":"Identifies specific malicious URL patterns","Reference":"","Score":50}]
+[]
+[]
