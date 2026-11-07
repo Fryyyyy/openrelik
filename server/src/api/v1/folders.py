@@ -1,0 +1,984 @@
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import asyncio
+import json
+import logging
+import uuid
+from typing import List
+
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.orm import Session
+from sse_starlette import EventSourceResponse
+
+import config
+from auth.common import get_current_active_user
+from datastores.sql.crud.authz import check_user_access, require_access
+from datastores.sql.crud.file import get_files_from_db
+from datastores.sql.crud.folder import (
+    CaseRefTakenError,
+    FolderSortKey,
+    FolderSortOrder,
+    InvalidCaseRefError,
+    InvalidCursorError,
+    create_root_folder_in_db,
+    create_subfolder_in_db,
+    delete_folder_from_db,
+    get_all_folders_from_db,
+    get_folder_by_case_ref_from_db,
+    get_folder_from_db,
+    get_root_folders_from_db,
+    get_shared_folders_from_db,
+    get_subfolders_from_db,
+    set_folder_case_ref_in_db,
+    update_folder_in_db,
+)
+from datastores.sql.crud.group import (
+    create_group_role_in_db,
+    delete_group_role_from_db,
+    get_group_by_name_from_db,
+    get_group_from_db,
+    group_role_exists,
+)
+from datastores.sql.crud.user import (
+    create_user_role_in_db,
+    delete_user_role_from_db,
+    get_user_by_username_from_db,
+    get_user_from_db,
+    user_role_exists,
+)
+from datastores.sql.database import get_db_connection
+from datastores.sql.models.role import Role
+from lib.investigation_utils import generate_initial_state
+from lib.stream_manager import stream_manager
+
+from openrelik_common import telemetry
+
+from . import schemas
+
+router = APIRouter()
+
+logger = logging.getLogger(__name__)
+
+
+def _can_see_case_folder(db: Session, current_user: schemas.User, folder) -> bool:
+    """Return whether the user can see a case folder.
+
+    Users with any role on the folder can, and so can admins, who need to find the folder
+    holding a reference to fix it.
+    """
+    return current_user.is_admin or check_user_access(
+        db, current_user, allowed_roles=[Role.VIEWER, Role.EDITOR, Role.OWNER], folder=folder
+    )
+
+
+def _case_ref_taken(db: Session, current_user: schemas.User, error: CaseRefTakenError):
+    """Build the 409 for a case reference another folder has.
+
+    Users who can see that folder learn which one it is, so they can use it. Others only
+    learn that the case exists, which uniqueness can't avoid.
+    """
+    folder = error.folder
+    if folder is not None and _can_see_case_folder(db, current_user, folder):
+        detail = (
+            f'Case {error.case_ref} already exists: folder {folder.id} "{folder.display_name}", '
+            f"owned by {folder.user.username}."
+        )
+    else:
+        detail = f"Case {error.case_ref} already exists. Ask your OpenRelik admin for access."
+    return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+
+
+def _get_case_folder_for_update(db: Session, current_user: schemas.User, folder_id: int):
+    """Return the folder whose case reference the user wants to change.
+
+    Editors and owners of the folder, and admins, can change it. This does the checks of
+    require_access by hand, since that has no exception for admins, who need to fix case
+    references on any folder.
+    """
+    folder = get_folder_from_db(db, folder_id)
+    if not folder or folder.is_deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Folder not found.")
+    if not current_user.is_admin and not check_user_access(
+        db, current_user, allowed_roles=[Role.EDITOR, Role.OWNER], folder=folder
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to folder")
+    return folder
+
+
+# Get all root folders for a user
+@router.get("/")
+def get_root_folders(
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+) -> List[schemas.FolderResponseCompact]:
+    """Get all root folders for a user.
+
+    Args:
+        db (Session): database session
+        current_user (User): current user
+
+    Returns:
+        list: list of folders
+    """
+    return get_root_folders_from_db(db, current_user)
+
+
+# Get all shared root folders for a user
+@router.get("/shared/")
+def get_shared_folders(
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+) -> List[schemas.FolderResponseCompact]:
+    """Get all shared folders for a user.
+
+    Args:
+        db (Session): database session
+        current_user (User): current user
+
+    Returns:
+        list: list of folders
+    """
+    return get_shared_folders_from_db(db, current_user)
+
+
+# Get all shared root folders for a user
+@router.get("/all/")
+def get_all_folders(
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(40, ge=0),
+    q: str | None = None,
+    sort: FolderSortKey = "created_at",
+    order: FolderSortOrder = "desc",
+    after: str | None = None,
+) -> schemas.FolderListPaginatedResponse:
+    """Get the user's root folders and the folders shared with them, or search them.
+
+    Pages can be requested by number, or by passing the next_cursor of the previous
+    response as after. Cursors don't skip or repeat folders when folders are created
+    or deleted while paging, and total_count is only computed for the first request.
+
+    Args:
+        db (Session): database session
+        current_user (User): current user
+        page (int): page number, ignored when after is set (and returned as None)
+        page_size (int): number of folders per page
+        q (str | None): search term
+        sort (str): created_at, updated_at or display_name (case-insensitive)
+        order (str): asc or desc
+        after (str | None): cursor from a previous response's next_cursor
+
+    Returns:
+        FolderListPaginatedResponse: folders with pagination metadata
+    """
+    try:
+        result, total_count, next_cursor = get_all_folders_from_db(
+            db,
+            current_user,
+            search_term=q,
+            page=page,
+            page_size=page_size,
+            sort=sort,
+            order=order,
+            after=after,
+        )
+    except InvalidCursorError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    response = schemas.FolderListPaginatedResponse(
+        folders=result,
+        total_count=total_count,
+        page=None if after else page,
+        page_size=page_size,
+        sort=sort,
+        order=order,
+        next_cursor=next_cursor,
+    )
+    return response
+
+
+# Get the folder of a case. Case references can contain "/", hence the path converter.
+@router.get("/case/{case_ref:path}")
+def get_case_folder(
+    case_ref: str,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+) -> schemas.FolderResponse:
+    """Get the folder with a case reference.
+
+    The reference is normalized first, so "CASE 123" finds the folder of "case-123". A case
+    that doesn't exist and one the user can't access both return 404, so the lookup doesn't
+    reveal which cases exist. Admins can get any case folder.
+
+    Args:
+        case_ref: case reference, normalized or not
+        db: database session
+        current_user: current user
+
+    Returns:
+        The case folder.
+
+    Raises:
+        HTTPException: 422 if the reference is malformed, 404 if there is no such case
+            folder the user can access.
+    """
+    try:
+        folder = get_folder_by_case_ref_from_db(db, case_ref)
+    except InvalidCaseRefError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    if folder is None or not _can_see_case_folder(db, current_user, folder):
+        raise HTTPException(status_code=404, detail="Case not found.")
+    return folder
+
+
+# Get all sub-folders for a parent folder
+@router.get("/{folder_id}/folders/")
+@require_access(allowed_roles=[Role.VIEWER, Role.EDITOR, Role.OWNER])
+def get_subfolders(
+    folder_id: str,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+) -> List[schemas.FolderResponseCompact]:
+    """
+    Get all subfolders within a specified folder.
+
+    Args:
+        folder_id: The ID of the parent folder.
+        db: The database session.
+        current_user: The currently authenticated user.
+
+    Returns:
+        A list of subfolders within the specified folder.
+
+    Raises:
+        HTTPException: If the parent folder does not exist or the user does not have permission to access it.
+    """
+    telemetry.add_attribute_to_current_span('folder_id', folder_id)
+    return get_subfolders_from_db(db, parent_folder_id=folder_id)
+
+
+# Get folder
+@router.get("/{folder_id}")
+@require_access(allowed_roles=[Role.VIEWER, Role.EDITOR, Role.OWNER])
+def get_folder(
+    folder_id: str,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+) -> schemas.FolderResponse:
+    """Get a folder from the database if the user has access.
+
+    Args:
+        folder_id: The ID of the folder to retrieve.
+        db: The database session.
+        current_user: The currently authenticated user.
+
+    Returns:
+        The folder object if found and the user has access.
+
+    Raises:
+        HTTPException: If the folder does not exist or the user does not have
+        permission to access it.
+    """
+    telemetry.add_attribute_to_current_span('folder_id', folder_id)
+    if not folder_id:
+        raise HTTPException(status_code=404, detail="Folder not found.")
+    try:
+        folder = get_folder_from_db(db, folder_id)
+        if folder is None:
+            raise HTTPException(status_code=404, detail="Folder not found.")
+    except ValueError as exception:
+        raise HTTPException(status_code=404, detail=str(exception))
+    if folder.is_deleted:
+        raise HTTPException(status_code=404, detail="Folder is deleted.")
+    return folder
+
+
+# Create root folder
+# No access check is necessary as active users can create their own root folders.
+@router.post("/", status_code=status.HTTP_201_CREATED)
+def create_root_folder(
+    new_folder_request: schemas.FolderCreateRequest,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+) -> schemas.FolderResponse:
+    """Create a folder.
+
+    Args:
+        db (Session): database session
+        new_folder_request (dict): dictionary for a folder
+        current_user (User): current user
+
+    Returns:
+        Folder: folder
+
+    Raises:
+        HTTPException: If the user does not have permission to create a folder, 422 if the
+            case reference is malformed, 409 if another folder has it.
+    """
+    try:
+        folder = create_root_folder_in_db(db, new_folder_request, current_user)
+    except InvalidCaseRefError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except CaseRefTakenError as e:
+        raise _case_ref_taken(db, current_user, e)
+    if folder.case_ref:
+        logger.info(
+            "case %s: created as folder %d by user %s", folder.case_ref, folder.id, current_user.id
+        )
+    return folder
+
+
+# Create subfolder
+@router.post("/{folder_id}/folders/", status_code=status.HTTP_201_CREATED)
+@require_access(allowed_roles=[Role.EDITOR, Role.OWNER])
+def create_subfolder(
+    new_folder_request: schemas.FolderCreateRequest,
+    folder_id: int,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+) -> schemas.FolderResponse:
+    """Create a sub folder.
+
+    Args:
+        db (Session): database session
+        new_folder_request (dict): dictionary for a folder
+        current_user (User): current user
+
+    Returns:
+        Folder: folder
+
+    Raises:
+        HTTPException: 422 if the request has a case reference, since only root folders can
+            be case folders.
+    """
+    telemetry.add_attribute_to_current_span('folder_id', folder_id)
+    if new_folder_request.case_ref is not None:
+        raise HTTPException(status_code=422, detail="only root folders can be case folders")
+    return create_subfolder_in_db(db, folder_id, new_folder_request, current_user)
+
+
+# Update folder
+@router.patch("/{folder_id}")
+@require_access(allowed_roles=[Role.EDITOR, Role.OWNER])
+async def update_folder(
+    folder_id: int,
+    folder_from_request: schemas.FolderUpdateRequest,
+    current_user: schemas.User = Depends(get_current_active_user),
+    db: Session = Depends(get_db_connection),
+) -> schemas.FolderResponse:
+    """Update a folder in the database.
+
+    Args:
+        folder_id (int): The ID of the folder to update.
+        folder_from_request (schemas.FolderUpdateRequest): The updated folder data.
+        current_user (schemas.User): The currently authenticated user.
+        db (Session): The database session.
+
+    Returns:
+        schemas.FolderResponse: The updated folder data.
+
+    Raises:
+        HTTPException: If the user does not have permission to update it.
+    """
+    telemetry.add_attribute_to_current_span('folder_id', folder_id)
+
+    folder_from_db = get_folder_from_db(db, folder_id)
+    folder_model = schemas.FolderCreate(**folder_from_db.__dict__)
+
+    # Update folder data with supplied values
+    update_data = folder_from_request.model_dump(exclude_unset=True)
+    updated_folder_model = folder_model.model_copy(update=update_data)
+
+    return update_folder_in_db(db, updated_folder_model)
+
+
+# Get files for a folder
+@router.get("/{folder_id}/files/")
+@require_access(allowed_roles=[Role.VIEWER, Role.EDITOR, Role.OWNER])
+def get_folder_files(
+    folder_id: str,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+) -> List[schemas.FileResponseCompactList]:
+    telemetry.add_attribute_to_current_span('folder_id', folder_id)
+    return get_files_from_db(db, folder_id)
+
+
+# Delete folder
+@router.delete("/{folder_id}", status_code=status.HTTP_204_NO_CONTENT)
+@require_access(allowed_roles=[Role.OWNER])
+def delete_folder(
+    folder_id: int,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+):
+    telemetry.add_attribute_to_current_span('folder_id', folder_id)
+    folder = get_folder_from_db(db, folder_id)
+    # A deleted folder keeps its reference as a record, but no longer holds it.
+    case_ref = folder.case_ref if folder and not folder.is_deleted else None
+    delete_folder_from_db(db, folder_id)
+    if case_ref:
+        logger.info(
+            "case %s: freed by deleting folder %d by user %s", case_ref, folder_id, current_user.id
+        )
+
+
+# Set the case reference of a folder
+@router.put("/{folder_id}/case")
+def set_folder_case_ref(
+    folder_id: int,
+    request: schemas.FolderCaseRefRequest,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+) -> schemas.FolderResponse:
+    """Make a root folder the folder of a case, or change its case reference.
+
+    Args:
+        folder_id: The ID of the root folder.
+        request: The case reference, normalized or not.
+        db: Database session.
+        current_user: The currently authenticated user.
+
+    Returns:
+        The updated folder.
+
+    Raises:
+        HTTPException: 404 if the folder doesn't exist, 403 if the user is not an editor or
+            owner of the folder or an admin, 422 if the reference is malformed or the folder
+            is a subfolder, 409 if another folder has the reference.
+    """
+    telemetry.add_attribute_to_current_span('folder_id', folder_id)
+    folder = _get_case_folder_for_update(db, current_user, folder_id)
+    previous = folder.case_ref
+    try:
+        folder = set_folder_case_ref_in_db(db, folder, request.case_ref)
+    except InvalidCaseRefError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except CaseRefTakenError as e:
+        raise _case_ref_taken(db, current_user, e)
+    if folder.case_ref != previous:
+        logger.info(
+            "case %s: set on folder %d by user %s (was %s)",
+            folder.case_ref,
+            folder_id,
+            current_user.id,
+            previous,
+        )
+    return folder
+
+
+# Remove the case reference of a folder
+@router.delete("/{folder_id}/case", status_code=status.HTTP_204_NO_CONTENT)
+def clear_folder_case_ref(
+    folder_id: int,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+):
+    """Remove the case reference of a folder. The folder stays, and the reference is free.
+
+    Args:
+        folder_id: The ID of the folder.
+        db: Database session.
+        current_user: The currently authenticated user.
+
+    Raises:
+        HTTPException: 404 if the folder doesn't exist, 403 if the user is not an editor or
+            owner of the folder or an admin.
+    """
+    telemetry.add_attribute_to_current_span('folder_id', folder_id)
+    folder = _get_case_folder_for_update(db, current_user, folder_id)
+    previous = folder.case_ref
+    set_folder_case_ref_in_db(db, folder, None)
+    if previous:
+        logger.info(
+            "case %s: removed from folder %d by user %s", previous, folder_id, current_user.id
+        )
+
+
+# Share folder
+@router.post("/{folder_id}/roles")
+@require_access(allowed_roles=[Role.EDITOR, Role.OWNER])
+def share_folder(
+    folder_id: int,
+    request: schemas.FolderShareRequest,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+) -> schemas.FolderResponse:
+    """Share a folder.
+    Assigns specified roles to users and groups for the given folder.
+
+    The `@require_access` decorator ensures the current user has EDITOR or OWNER
+    permissions on the folder.
+
+    Args:
+        folder_id: The ID of the folder to share.
+        request: The share request details including users, groups, and roles.
+        db: Database session.
+        current_user: The currently authenticated user.
+
+    Returns:
+        The updated folder information with new roles.
+
+    Raises:
+        HTTPException:
+            - 400 Bad Request: If an invalid role string is provided.
+            - 404 Not Found: If the folder, a user, or a group is not found,
+                             or if trying to share a deleted folder.
+            - 409 Conflict: If a user or group already has the specified role
+                            on the folder.
+    """
+    telemetry.add_attribute_to_current_span('folder_id', folder_id)
+    folder_to_share = get_folder_from_db(db, folder_id)
+    # @require_access handles folder not found, but this is an explicit check.
+    if not folder_to_share:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Folder not found.")
+    if folder_to_share.is_deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Cannot share a deleted folder.",
+        )
+    user_permission_role = None
+    group_permission_role = None
+    try:
+        if request.user_ids or request.user_names:
+            user_permission_role = Role(request.user_role)
+        if request.group_ids or request.group_names:
+            group_permission_role = Role(request.group_role)
+
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid role provided. Valid roles are: {[r.value for r in Role]}",
+        )
+
+    # Process User IDs
+    if request.user_ids:
+        for user_id_to_share in request.user_ids:
+            user = get_user_from_db(db, user_id_to_share)
+            if not user:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"User with ID {user_id_to_share} not found.",
+                )
+            # Use enum member's name (e.g., "OWNER") instead of value (e.g., "Owner")
+            if user_role_exists(db, user_id_to_share, folder_id, user_permission_role.name):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"User ID {user_id_to_share} already has the role '{user_permission_role.name}' on folder {folder_id}.",
+                )
+            # Pass enum member's name for creation
+            create_user_role_in_db(
+                db, user_permission_role.name, user_id_to_share, folder_id=folder_id
+            )
+
+    # Process User Names
+    if request.user_names:
+        for user_name_to_share in request.user_names:
+            user = get_user_by_username_from_db(db, user_name_to_share)
+            if not user:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"User with username '{user_name_to_share}' not found.",
+                )
+            # Use enum member's name (e.g., "OWNER") instead of value (e.g., "Owner")
+            if user_role_exists(db, user.id, folder_id, user_permission_role.name):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"User '{user_name_to_share}' (ID: {user.id}) already has the role '{user_permission_role.name}' on folder {folder_id}.",
+                )
+            # Pass enum member's name for creation
+            create_user_role_in_db(db, user_permission_role.name, user.id, folder_id=folder_id)
+
+    # Process Group IDs
+    if request.group_ids:
+        for group_id_to_share in request.group_ids:
+            group = get_group_from_db(db, group_id_to_share)
+            if not group:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Group with ID {group_id_to_share} not found.",
+                )
+            # Use enum member's name (e.g., "OWNER") instead of value (e.g., "Owner")
+            if group_role_exists(db, group_id_to_share, folder_id, group_permission_role.name):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Group ID {group_id_to_share} already has the role '{group_permission_role.name}' on folder {folder_id}.",
+                )
+            # Pass enum member's name for creation
+            create_group_role_in_db(
+                db, group_permission_role.name, group_id_to_share, folder_id=folder_id
+            )
+
+    # Process Group Names
+    if request.group_names:
+        for group_name_to_share in request.group_names:
+            group = get_group_by_name_from_db(db, group_name_to_share)
+            if not group:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Group with name '{group_name_to_share}' not found.",
+                )
+            # Use enum member's name (e.g., "OWNER") instead of value (e.g., "Owner")
+            if group_role_exists(db, group.id, folder_id, group_permission_role.name):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Group '{group_name_to_share}' (ID: {group.id}) already has the role '{group_permission_role.name}' on folder {folder_id}.",
+                )
+            # Pass enum member's name for creation
+            create_group_role_in_db(db, group_permission_role.name, group.id, folder_id=folder_id)
+
+    return get_folder_from_db(db, folder_id)
+
+
+@router.get("/{folder_id}/roles/me")
+@require_access(allowed_roles=[Role.VIEWER, Role.EDITOR, Role.OWNER])
+def get_my_folder_role(
+    folder_id: int,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+):
+    telemetry.add_attribute_to_current_span('folder_id', folder_id)
+    try:
+        folder = get_folder_from_db(db, folder_id)
+        return check_user_access(
+            db,
+            current_user,
+            allowed_roles=[Role.VIEWER, Role.EDITOR, Role.OWNER],
+            folder=folder,
+        )
+    except ValueError as exception:
+        raise HTTPException(status_code=404, detail=str(exception))
+
+
+@router.delete("/{folder_id}/roles/groups/{role_id}")
+@require_access(allowed_roles=[Role.EDITOR, Role.OWNER])
+def delete_group_role(
+    folder_id: int,
+    role_id: int,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+):
+    telemetry.add_attribute_to_current_span('folder_id', folder_id)
+    telemetry.add_attribute_to_current_span('role_id', role_id)
+    if not delete_group_role_from_db(db, role_id, folder_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Role not found.")
+
+
+@router.delete("/{folder_id}/roles/users/{role_id}")
+@require_access(allowed_roles=[Role.EDITOR, Role.OWNER])
+def delete_user_role(
+    folder_id: int,
+    role_id: int,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+):
+    telemetry.add_attribute_to_current_span('folder_id', folder_id)
+    telemetry.add_attribute_to_current_span('role_id', role_id)
+    if not delete_user_role_from_db(db, role_id, folder_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Role not found.")
+
+
+# Create a new session in ADK
+@router.post("/{folder_id}/investigations/init")
+@require_access(allowed_roles=[Role.VIEWER, Role.EDITOR, Role.OWNER])
+async def create_adk_session(
+    folder_id: int,
+    request: schemas.AgentSessionRequest,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+) -> schemas.AgentSessionResponse:
+    telemetry.add_attribute_to_current_span('folder_id', folder_id)
+    ADK_BASE_URL = config.config.get("experiments", {}).get("agents", {}).get("adk_server_url")
+
+    # Ensure the ADK server URL is configured.
+    if not ADK_BASE_URL:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="ADK server URL is not configured.",
+        )
+
+    async def _get_folder_contents():
+        """
+        Retrieves file metadata for a specific folder.
+
+        Returns:
+            A list of file dictionaries.
+            Returns an empty list '[]' if no files are found.
+        """
+        # Fetch file objects from the database.
+        files_from_db = get_files_from_db(db, folder_id)
+
+        # Use a list comprehension to build the list of file information.
+        file_data_list = [
+            {
+                "filename": file.display_name,
+                "mime_type": file.magic_mime,
+                "mime_description": file.magic_text,
+            }
+            for file in files_from_db
+        ]
+
+        return file_data_list
+
+    async def _create_adk_session(session_id: str):
+        """Creates a new session to ADK for the given app and user.
+
+        Args:
+            session_id (str): The unique session ID to create.
+
+        Returns:
+            tuple: A tuple containing the response and session ID.
+        """
+        url = f"{ADK_BASE_URL}/apps/dfir_multi_agent/users/{current_user.id}/sessions/{session_id}"
+        headers = {"Content-Type": "application/json"}
+        files_list = await _get_folder_contents()
+        payload = generate_initial_state(context=request.context, files=files_list)
+
+        try:
+            response = httpx.post(url, headers=headers, json=payload.dict())
+            response.raise_for_status()
+            return response, session_id
+        except httpx.HTTPStatusError as e:
+            print(f"HTTP error creating session: {e.response.status_code} - {e.response.text}")
+            return None, session_id
+        except httpx.RequestError as e:
+            print(f"Request error creating session: {e}")
+            return None, session_id
+
+    session = await _create_adk_session(session_id=str(uuid.uuid4()))
+    session_id = session[1]
+
+    return schemas.AgentSessionResponse(session_id=session_id)
+
+
+# Run the ADK agent
+@router.post("/{folder_id}/investigations/run")
+@require_access(allowed_roles=[Role.VIEWER, Role.EDITOR, Role.OWNER])
+async def start_investigation(
+    folder_id: int,
+    request: schemas.AgentRequest,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+) -> EventSourceResponse:
+    """Run an agent to answer investigative questions.
+
+    This starts a Server-Sent Events (SSE) stream to the Agent Development Kit (ADK) server and
+    mediates all ADK events and responses back to the client.
+
+    Args:
+        folder_id (int): The ID of the folder to limit file access.
+        request (schemas.AgentRequest): The request containing the agent name and question prompt.
+        db (Session): The database session.
+        current_user (schemas.User): The currently authenticated user.
+    """
+    telemetry.add_attribute_to_current_span('folder_id', folder_id)
+
+    ADK_BASE_URL = config.config.get("experiments", {}).get("agents", {}).get("adk_server_url")
+
+    # Ensure the ADK server URL is configured.
+    if not ADK_BASE_URL:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="ADK server URL is not configured.",
+        )
+
+    session_id = request.session_id
+
+    async def _background_producer(
+        session_id: str, adk_url: str, payload: dict, current_user_id: int
+    ):
+        """
+        Background task to stream data from ADK to the session queue.
+        """
+        session = stream_manager.get_session(session_id)
+        if not session:
+            # Should not happen if created correctly
+            return
+
+        url = f"{adk_url}/run_sse"
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("POST", url, headers=headers, json=payload) as response:
+                    response.raise_for_status()
+                    async for chunk in response.aiter_bytes():
+                        decoded_chunk = chunk.decode("utf-8")
+                        for line in decoded_chunk.splitlines():
+                            if line.startswith("data: "):
+                                try:
+                                    json_data = json.loads(line[len("data: ") :])
+                                    await session.broadcast(json.dumps(json_data))
+                                except json.JSONDecodeError:
+                                    pass
+                    await session.broadcast(
+                        json.dumps({"type": "complete", "message": "All agents finished."})
+                    )
+
+        except httpx.HTTPStatusError as e:
+            error_message = (
+                f"HTTP error during SSE stream: {e.response.status_code} - {e.response.text}"
+            )
+            await session.broadcast(json.dumps({"type": "error", "message": error_message}))
+        except httpx.RequestError as e:
+            error_message = f"Request error during SSE stream: {e}"
+            await session.broadcast(json.dumps({"type": "error", "message": error_message}))
+        except Exception as e:
+            error_message = f"Unexpected error during SSE stream: {e}"
+            await session.broadcast(json.dumps({"type": "error", "message": error_message}))
+
+        stream_manager.remove_session(session_id)
+
+    async def _stream_generator(session_id: str):
+        """
+        Consumes events from the session queue and yields them to the client.
+        """
+        session = stream_manager.get_session(session_id)
+        if not session:
+            yield json.dumps({"type": "error", "message": "Session not found or expired."})
+            return
+
+        # Register as listener (get a personal queue with history)
+        queue = await session.add_listener()
+
+        try:
+            while True:
+                # Check for cancellation?
+                # The queue.get() will block.
+                # If the session is closed, or completed, we need to know.
+
+                try:
+                    data = await queue.get()
+                    yield data
+                    queue.task_done()
+
+                    try:
+                        js = json.loads(data)
+                        if js.get("type") == "complete" or js.get("type") == "error":
+                            break
+                    except:
+                        pass
+                except asyncio.CancelledError:
+                    break
+        finally:
+            session.remove_listener(queue)
+
+    # Check if session exists
+    session = stream_manager.get_session(session_id)
+
+    if not session:
+        if not request.user_message:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No active investigation session found.",
+            )
+
+        # Create new session and background task
+        return_prompt = {
+            "role": "user",
+            "parts": [
+                {
+                    "text": request.user_message,
+                }
+            ],
+        }
+
+        payload = {
+            "appName": request.agent_name,
+            "userId": f"{current_user.id}",
+            "sessionId": session_id,
+            "newMessage": return_prompt,
+        }
+
+        task = asyncio.create_task(
+            _background_producer(session_id, ADK_BASE_URL, payload, current_user.id)
+        )
+        # Create session first so we can add listener immediately
+        # Important: pass the task so the session can track it
+        session = stream_manager.create_session(session_id, task)
+
+    elif request.user_message and session.task.done():
+        # Session exists but previous task is finished.
+        # User is sending a new message, so we start a new background task.
+
+        return_prompt = {
+            "role": "user",
+            "parts": [
+                {
+                    "text": request.user_message,
+                }
+            ],
+        }
+
+        payload = {
+            "appName": request.agent_name,
+            "userId": f"{current_user.id}",
+            "sessionId": session_id,
+            "newMessage": return_prompt,
+        }
+
+        task = asyncio.create_task(
+            _background_producer(session_id, ADK_BASE_URL, payload, current_user.id)
+        )
+        # Update the existing session with the new task
+        session.task = task
+        session.touch()
+
+    return EventSourceResponse(_stream_generator(session_id))
+
+
+# Fetch an existing ADK session
+# We are using POST here because the client side SSE connection is created
+# using POST and not GET.
+@router.post("/{folder_id}/investigations/{session_id}")
+@require_access(allowed_roles=[Role.VIEWER, Role.EDITOR, Role.OWNER])
+async def get_adk_sse_session(
+    folder_id: int,
+    session_id: str,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+) -> EventSourceResponse:
+    WAIT_TIME = 5
+    telemetry.add_attribute_to_current_span('folder_id', folder_id)
+    telemetry.add_attribute_to_current_span('session_id', session_id)
+
+    async def _get_session(session_id: str):
+        ADK_BASE_URL = config.config.get("experiments", {}).get("agents", {}).get("adk_server_url")
+
+        url = f"{ADK_BASE_URL}/apps/dfir_multi_agent/users/{current_user.id}/sessions/{session_id}"
+        headers = {"Content-Type": "application/json"}
+
+        async with httpx.AsyncClient(timeout=None) as client:
+            while True:
+                try:
+                    response = await client.get(url, headers=headers)
+                    response.raise_for_status()
+                    yield json.dumps(response.json())
+                except httpx.HTTPStatusError as e:
+                    print(f"HTTP fetching session: {e.response.status_code} - {e.response.text}")
+                    yield json.dumps({"type": "error", "message": str(e)})
+                    break
+                except httpx.RequestError as e:
+                    print(f"Request error while fetching session: {e}")
+                    yield json.dumps({"type": "error", "message": str(e)})
+                    break
+
+                await asyncio.sleep(WAIT_TIME)
+
+    return EventSourceResponse(_get_session(session_id))

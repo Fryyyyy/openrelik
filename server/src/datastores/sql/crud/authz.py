@@ -1,0 +1,238 @@
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import asyncio
+from functools import wraps
+from typing import Callable
+
+from fastapi import HTTPException, status
+from sqlalchemy.orm import Session
+
+from datastores.sql.models.file import File
+from datastores.sql.models.folder import Folder
+from datastores.sql.models.group import GroupRole
+from datastores.sql.models.role import Role
+from datastores.sql.models.user import User, UserRole
+from datastores.sql.models.workflow import Task, Workflow
+
+
+class AuthorizationError(Exception):
+    """Raised when a user does not have permission to access a resource."""
+
+    def __init__(self, message: str):
+        self.message = message
+
+
+def raise_authorization_error(http_exception: bool, error_message: str):
+    """Raises either HTTPException or AuthorizationError."""
+    if http_exception:
+        raise HTTPException(status_code=403, detail=error_message)
+    else:
+        raise AuthorizationError(error_message)
+
+
+def check_user_access(
+    db: Session,
+    user: User,
+    allowed_roles: list,
+    folder: Folder = None,
+    file: File = None,
+):
+    """
+    Checks if a user has any of the allowed roles for a folder or file,
+    considering both direct and inherited permissions (for files).
+    Handles nested folders under revoked access folders.
+
+    Args:
+        db (Session): Database session.
+        user (User): User object.
+        allowed_roles (list): List of allowed roles.
+        folder (Folder, optional): Folder object. Defaults to None.
+        file (File, optional): File object. Defaults to None.
+
+    Returns:
+        bool: UserRole or GroupRole if authorized, False otherwise.
+
+    Raises:
+        ValueError: If neither folder nor file is provided.
+    """
+    if not db:
+        raise ValueError("Database session (db) cannot be None.")
+    if not user:
+        raise ValueError("User object cannot be None.")
+    if not folder and not file:
+        raise ValueError("Either folder or file must be provided.")
+
+    if file:
+        file_role = (
+            db.query(UserRole)
+            .filter(UserRole.user_id == user.id, UserRole.file_id == file.id)
+            .first()
+        )
+        if file_role and file_role.role in allowed_roles:
+            return file_role
+
+        # Check for file permissions via GroupRole
+        for group in user.groups:
+            group_role = (
+                db.query(GroupRole)
+                .filter(GroupRole.group_id == group.id, GroupRole.file_id == file.id)
+                .first()
+            )
+            if group_role and group_role.role in allowed_roles:
+                return group_role
+
+        # If no explicit file permission, check folder permissions
+        folder = file.folder
+
+    while folder:
+        folder_role = (
+            db.query(UserRole)
+            .filter(UserRole.user_id == user.id, UserRole.folder_id == folder.id)
+            .first()
+        )
+
+        if folder_role:
+            if folder_role.role == Role.NO_ACCESS:
+                return False  # Explicitly denied access, stop traversal
+
+            if folder_role.role in allowed_roles:
+                return folder_role
+
+        # Check for folder permissions via GroupRole
+        for group in user.groups:
+            group_role = (
+                db.query(GroupRole)
+                .filter(GroupRole.group_id == group.id, GroupRole.folder_id == folder.id)
+                .first()
+            )
+            if group_role and group_role.role in allowed_roles:
+                return group_role
+
+        folder = folder.parent
+
+    return False  # No access found
+
+
+def get_workflow_with_access(
+    db: Session, user: User, workflow_id: int, allowed_roles: list
+) -> Workflow:
+    """Get a workflow the user has one of the allowed roles on.
+
+    Access is checked on the workflow's own folder, not on any folder in the request URL, so
+    a user can't reach a workflow by putting a folder they own in the URL.
+
+    Raises:
+        HTTPException: 404 if the workflow doesn't exist, 403 if the user has no access.
+    """
+    workflow = db.get(Workflow, workflow_id)
+    if not workflow:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow not found.")
+    if not workflow.folder or not check_user_access(
+        db, user, allowed_roles, folder=workflow.folder
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to workflow")
+    return workflow
+
+
+def get_task_with_access(
+    db: Session, user: User, task_id: int, allowed_roles: list, workflow_id: int = None
+) -> Task:
+    """Get a task the user has one of the allowed roles on, via the folder of its workflow.
+
+    Args:
+        workflow_id: If given, the task must belong to this workflow.
+
+    Raises:
+        HTTPException: 404 if the task doesn't exist or isn't part of the workflow, 403 if the
+            user has no access.
+    """
+    task = db.get(Task, task_id)
+    if not task or (workflow_id is not None and task.workflow_id != workflow_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
+    workflow = task.workflow
+    if not workflow or not workflow.folder or not check_user_access(
+        db, user, allowed_roles, folder=workflow.folder
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to task")
+    return task
+
+
+def require_access(allowed_roles: list, http_exception: bool = True, error_message: str = None):
+    def decorator(func: Callable):
+
+        def _check_access(kwargs):
+            """Shared access check logic for both sync and async wrappers."""
+            db = kwargs.get("db")
+            folder_id = kwargs.get("folder_id")
+            file_id = kwargs.get("file_id")
+            current_user = kwargs.get("current_user")
+
+            if folder_id is not None:
+                try:
+                    folder_id = int(folder_id)
+                except (ValueError, TypeError):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Invalid folder ID format.",
+                    )
+                folder = db.get(Folder, folder_id)
+                if not folder:
+                    raise HTTPException(status_code=404, detail="Folder not found.")
+                if not check_user_access(db, current_user, allowed_roles, folder=folder):
+                    raise_authorization_error(
+                        http_exception, error_message or "No access to folder"
+                    )
+
+            if file_id is not None:
+                try:
+                    file_id = int(file_id)
+                except (ValueError, TypeError):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Invalid file ID format.",
+                    )
+                file = db.get(File, file_id)
+                if not file:
+                    raise HTTPException(status_code=404, detail="File not found.")
+                if not check_user_access(db, current_user, allowed_roles, file=file):
+                    raise_authorization_error(http_exception, error_message or "No access to file")
+
+            if folder_id is None and file_id is None:
+                # Fail closed: a decorated route must name the folder or file to check.
+                if http_exception:
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="Access check misconfigured: no folder or file to check.",
+                    )
+                raise AuthorizationError("No folder_id or file_id to check access for.")
+
+        if asyncio.iscoroutinefunction(func):
+
+            @wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                _check_access(kwargs)
+                return await func(*args, **kwargs)
+
+            return async_wrapper
+        else:
+
+            @wraps(func)
+            def sync_wrapper(*args, **kwargs):
+                _check_access(kwargs)
+                return func(*args, **kwargs)
+
+            return sync_wrapper
+
+    return decorator

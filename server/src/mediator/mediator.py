@@ -1,0 +1,397 @@
+# Copyright 2024-2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import base64
+import json
+import os
+import time
+import uuid
+from threading import Lock
+from typing import Any, Dict, Optional
+
+from celery import Celery
+from celery import states as celery_states
+from celery.events.state import State as CeleryEventState
+from celery.events.state import Task as CeleryEventTask
+from celery.result import AsyncResult
+from openrelik_common import telemetry
+from sqlalchemy.orm import Session
+
+from api.v1 import schemas
+
+# Import models to make the ORM register correctly.
+from datastores.sql import database
+from datastores.sql.crud.file import (
+    create_file_in_db,
+    create_file_report_in_db,
+    get_file_by_uuid_from_db,
+)
+from datastores.sql.crud.workflow import (
+    create_task_report_in_db,
+    get_task_by_uuid_from_db,
+    get_workflow_from_db,
+)
+from datastores.sql.models.file import File
+from datastores.sql.models.workflow import Task
+from lib.file_hashes import generate_hashes
+from tasks.hashing.file_hashes_tasks import QUEUE_NAME as HASHING_QUEUE_NAME
+from tasks.hashing.file_hashes_tasks import TASK_NAME as HASHING_TASK_NAME
+
+# Number of times to retry database lookups
+MAX_DATABASE_LOOKUP_RETRIES = 10
+DATABASE_LOOKUP_RETRY_DELAY_SECONDS = 1
+
+# How long to cache the openrelik-hashing worker availability check. Detecting the
+# worker requires a ~1s Celery inspect() broadcast, so we cache it to avoid running
+# that on every task event in the mediator's single-threaded loop.
+HASHING_WORKER_CHECK_TTL_SECONDS = 3600
+_hashing_worker_cache = {"available": False, "checked_at": None}
+
+# A dictionary where the key is the UUID of any MISSING file needed for a file report.
+PENDING_FILE_REPORTS = {}
+# Lock is important because the mediator runs sequentially, but a background
+# thread might be modifying this structure.
+PENDING_FILE_REPORTS_LOCK = Lock()
+
+
+def get_task_from_db(db: Session, task_uuid: str) -> Optional[Task]:
+    """Retrieves a task from the database with retry logic.
+
+    Args:
+        db: The database session.
+        task_uuid: The UUID of the task to retrieve.
+
+    Returns:
+        The task object if found, otherwise None.
+    """
+    task = None
+    for retry_count in range(MAX_DATABASE_LOOKUP_RETRIES):
+        task = get_task_by_uuid_from_db(db, task_uuid)
+        if task:
+            break
+        print(f"Database lookup for task {task_uuid} failed, retrying..{retry_count + 1}")
+        time.sleep(DATABASE_LOOKUP_RETRY_DELAY_SECONDS)
+    return task
+
+
+def update_database(db: Session, model_instance: Any) -> None:
+    """Updates a model instance in the database.
+
+    Args:
+        db: The database session.
+        model_instance: The model instance to update.
+    """
+    db.add(model_instance)
+    db.commit()
+    db.refresh(model_instance)
+
+
+def create_file_in_database(
+    db: Session,
+    file_data: Dict[str, Any],
+    task_result_dict: Dict[str, Any],
+    db_task: Task,
+) -> File:
+    """Creates a file in the database based on the provided file data and task result.
+
+    Args:
+        db: The database session.
+        file_data: A dictionary containing file data.
+        task_result_dict: A dictionary containing task result data.
+        db_task: The task object in the database.
+
+    Returns:
+        The created file object.
+    """
+    workflow = get_workflow_from_db(db, task_result_dict.get("workflow_id"))
+    display_name = file_data.get("display_name")
+    data_type = file_data.get("data_type")
+    file_uuid = uuid.UUID(file_data.get("uuid"))
+    file_extension = file_data.get("extension")
+    original_path = file_data.get("original_path")
+    source_file_id = file_data.get("source_file_id")
+    new_file = schemas.FileCreate(
+        display_name=display_name,
+        uuid=file_uuid,
+        filename=display_name,
+        extension=file_extension.lstrip("."),
+        original_path=original_path,
+        data_type=data_type,
+        folder_id=workflow.folder.id,
+        user_id=workflow.user.id,
+        source_file_id=source_file_id,
+        task_output_id=db_task.id,
+    )
+    return create_file_in_db(db, new_file, workflow.user)
+
+
+def create_or_defer_file_report(db: Session, file_report: Dict[str, Any], task_id: int):
+    """
+    Creates a file report in the database or defer it if the input file is missing.
+    This is to handle cases where the file report depends on a file that has not yet been created
+    due to Celery message ordering.
+
+    Args:
+        db: The database session.
+        file_report: A dictionary containing file report data.
+        task_id: The ID of the task associated with the file report.
+    """
+    input_file_uuid = file_report.get("input_file_uuid")
+    input_file = get_file_by_uuid_from_db(db, input_file_uuid)
+
+    content_file_uuid = file_report.get("content_file_uuid")
+    content_file = get_file_by_uuid_from_db(db, content_file_uuid)
+
+    missing_dependencies = set()
+    if not input_file:
+        missing_dependencies.add(input_file_uuid)
+    if not content_file:
+        missing_dependencies.add(content_file_uuid)
+
+    # If any dependencies are missing, defer the report creation and return early.
+    if missing_dependencies:
+        print("Deferring file report creation, missing dependencies:", missing_dependencies)
+        report_data = (file_report, task_id)
+        with PENDING_FILE_REPORTS_LOCK:
+            for missing_uuid in missing_dependencies:
+                PENDING_FILE_REPORTS.setdefault(missing_uuid, []).append(report_data)
+        return
+
+    # If all dependencies are available, create the file report in the database.
+    new_file_report = schemas.FileReportCreate(
+        summary=file_report.get("summary"),
+        priority=file_report.get("priority"),
+        input_file_uuid=file_report.get("input_file_uuid"),
+        content_file_uuid=file_report.get("content_file_uuid"),
+    )
+    create_file_report_in_db(db, new_file_report, task_id)
+
+
+def process_pending_file_reports(db: Session, created_file_uuid: str):
+    """Processes any pending file reports.
+
+    Args:
+        db: The database session.
+        created_file_uuid: The UUID of the file that was just created.
+    """
+    reports_to_process = []
+
+    with PENDING_FILE_REPORTS_LOCK:
+        reports_to_process = PENDING_FILE_REPORTS.pop(created_file_uuid, [])
+
+    for file_report, task_id in reports_to_process:
+        create_or_defer_file_report(db, file_report, task_id)
+
+
+def process_task_progress_event(
+    db: Session, state: CeleryEventState, event: Dict[str, Any]
+) -> None:
+    """Processes a task progress event and updates the database.
+
+    Args:
+        db: The database session.
+        state: The Celery state object.
+        event: The Celery event.
+    """
+    state.event(event)
+    celery_task = state.tasks.get(event["uuid"])
+    db_task = get_task_from_db(db, celery_task.uuid)
+    db_task.status_short = celery_task.state
+    db_task.status_progress = json.dumps(event.get("data"))
+    update_database(db, db_task)
+
+
+def is_hashing_worker_available(celery_app: Celery) -> bool:
+    """Return True if a worker is consuming the openrelik-hashing queue.
+
+    The result is cached for HASHING_WORKER_CHECK_TTL_SECONDS to avoid a ~1s
+    inspect() broadcast on every task event.
+
+    Args:
+        celery_app: The Celery application.
+
+    Returns:
+        True if the openrelik-hashing worker is available, otherwise False.
+    """
+    now = time.monotonic()
+    checked_at = _hashing_worker_cache["checked_at"]
+    if checked_at is not None and (now - checked_at) < HASHING_WORKER_CHECK_TTL_SECONDS:
+        return _hashing_worker_cache["available"]
+
+    available = False
+    try:
+        active_queues = celery_app.control.inspect().active_queues() or {}
+        available = any(
+            queue.get("name") == HASHING_QUEUE_NAME
+            for queues in active_queues.values()
+            for queue in queues
+        )
+    except Exception:
+        # Broker/inspect failure: be safe and fall back to inline hashing.
+        available = False
+
+    _hashing_worker_cache["available"] = available
+    _hashing_worker_cache["checked_at"] = now
+    return available
+
+
+def hash_file(celery_app: Celery, file_id: int) -> None:
+    """Hash a file, using the background worker when available.
+
+    Dispatches to the dedicated openrelik-hashing worker if it is available,
+    otherwise falls back to the original blocking inline hashing so that files
+    still get hashed on deployments without the hashing worker.
+
+    Args:
+        celery_app: The Celery application.
+        file_id: The ID of the file to hash.
+    """
+    if is_hashing_worker_available(celery_app):
+        celery_app.send_task(HASHING_TASK_NAME, args=[file_id], queue=HASHING_QUEUE_NAME)
+    else:
+        generate_hashes(file_id)
+
+
+def process_successful_task(
+    db: Session, celery_task: CeleryEventTask, db_task: Task, celery_app: Celery
+) -> None:
+    """Processes a successful Celery task and updates the database.
+
+    Args:
+        db: The database session.
+        celery_task: The Celery task object.
+        db_task: The task object in the database.
+        celery_app: The Celery application.
+    """
+    celery_task_result = AsyncResult(celery_task.uuid, app=celery_app).get()
+    result_dict = json.loads(base64.b64decode(celery_task_result.encode("utf-8")).decode("utf-8"))
+    db_task.result = json.dumps(result_dict)
+
+    output_files = result_dict.get("output_files", [])
+    task_files = result_dict.get("task_files", [])
+    file_reports = result_dict.get("file_reports", [])
+    task_report = result_dict.get("task_report", {})
+
+    # Create files from the resulting output files. Individual files can opt
+    # out of DB registration by setting `register_in_db=False`; defaults to
+    # True so existing workers keep the current behavior.
+    for file_data in output_files:
+        if not file_data.get("register_in_db", True):
+            continue
+
+        new_file = create_file_in_database(db, file_data, result_dict, db_task)
+
+        # Process any pending reports that are waiting for this file
+        process_pending_file_reports(db, file_data.get("uuid"))
+
+        # Dispatch hashing to the background worker (or hash inline if it is not
+        # available) so it does not block the mediator's sequential event loop.
+        hash_file(celery_app, new_file.id)
+
+    # Create files from task log files
+    for task_file_data in task_files:
+        new_log_file = create_file_in_database(db, task_file_data, result_dict, db_task)
+        hash_file(celery_app, new_log_file.id)
+
+    for file_report in file_reports:
+        create_or_defer_file_report(db, file_report, db_task.id)
+
+    if task_report:
+        new_task_report = schemas.TaskReportCreate(
+            summary=task_report.get("summary"),
+            priority=task_report.get("priority"),
+            markdown=task_report.get("content"),
+        )
+        create_task_report_in_db(db, new_task_report, task_id=db_task.id)
+
+
+def process_failed_task(db: Session, celery_task: CeleryEventTask, db_task: Task) -> None:
+    """Processes a failed Celery task and updates the database.
+
+    Args:
+        db: The database session.
+        celery_task: The Celery task object.
+        db_task: The task object in the database.
+    """
+    db_task.error_exception = celery_task.info().get("exception")
+    db_task.error_traceback = celery_task.traceback
+
+
+def process_task_event(
+    db: Session, state: CeleryEventState, event: Dict[str, Any], celery_app: Celery
+) -> None:
+    """Processes a task event and updates the database.
+
+    Args:
+        db: The database session.
+        state: The Celery state object.
+        event: The Celery event.
+        celery_app: The Celery application.
+    """
+    state.event(event)
+    celery_task = state.tasks.get(event["uuid"])
+    db_task = get_task_from_db(db, celery_task.uuid)
+
+    print(celery_task.uuid, event.get("type"), celery_task.state)
+
+    if not db_task:
+        # Task might not be in the database yet, skip processing
+        return
+
+    db_task.status_short = celery_task.state
+
+    if celery_task.state == celery_states.SUCCESS:
+        process_successful_task(db, celery_task, db_task, celery_app)
+    elif celery_task.state == celery_states.FAILURE:
+        process_failed_task(db, celery_task, db_task)
+
+    db_task.runtime = celery_task.runtime
+    update_database(db, db_task)
+
+
+def monitor_celery_tasks(celery_app: Celery, db: Session) -> None:
+    """Monitor Celery tasks and update the database.
+
+    Args:
+        celery_app: The Celery application.
+        db: The database session.
+    """
+    state = celery_app.events.State()
+
+    def on_worker_event(event: Dict[str, Any]) -> None:
+        if event.get("type") == "worker-heartbeat":
+            return
+        print("Event.type", event.get("type"))
+
+    with celery_app.connection() as connection:
+        recv = celery_app.events.Receiver(
+            connection,
+            handlers={
+                "worker-heartbeat": on_worker_event,
+                "worker-online": on_worker_event,
+                "worker-offline": on_worker_event,
+                "task-progress": lambda event: process_task_progress_event(db, state, event),
+                "*": lambda event: process_task_event(db, state, event, celery_app),
+            },
+        )
+        recv.capture(limit=None, timeout=None, wakeup=True)
+
+
+if __name__ == "__main__":
+    redis_url = os.getenv("REDIS_URL")
+    celery_app = Celery(broker=redis_url, backend=redis_url)
+    telemetry.instrument_celery_app(celery_app)
+    db = database.SessionLocal()
+    # Start the Celery task monitoring loop
+    monitor_celery_tasks(celery_app, db)

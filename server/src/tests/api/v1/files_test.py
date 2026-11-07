@@ -1,0 +1,816 @@
+# Copyright 2024-2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for files endpoints."""
+
+import json
+import os
+from types import SimpleNamespace
+
+import pytest
+
+from api.v1.files import _is_database_file
+from datastores.sql.models.role import Role
+
+
+@pytest.mark.parametrize(
+    "theme, expected_background, expected_color, expected_scrollbar",
+    [("light", "#fff", "#000", "#ddd #fff"), ("dark", "#0e172a", "#fff", "#333 #000")],
+)
+def test_get_file_content(
+    fastapi_test_client,
+    mocker,
+    file_db_model,
+    setup_file_path_mock,  # Use the new fixture
+    theme,
+    expected_background,
+    expected_color,
+    expected_scrollbar,
+):
+    """Test the get_file_content endpoint."""
+    expected_path = setup_file_path_mock
+    mock_get_file_from_db = mocker.patch("api.v1.files.get_file_from_db")
+    mock_get_file_from_db.return_value = file_db_model
+    file_content = "Mocked file content"
+    mock_open = mocker.mock_open(read_data=file_content)
+    mocker.patch("builtins.open", mock_open)
+
+    response = fastapi_test_client.get(
+        f"/files/{file_db_model.id}/content?theme={theme}"
+    )
+
+    assert response.status_code == 200
+    assert (
+        f'<html style="background:{expected_background}; scrollbar-color: {expected_scrollbar};">'
+        in response.text
+    )
+    assert (
+        f'<pre style="color:{expected_color};padding:10px;white-space: pre-wrap; margin: 0; padding: 0;">{file_content}</pre>'
+        in response.text
+    )
+
+    # Use the expected path for the assertion
+    mock_open.assert_called_with(expected_path, "r", encoding="utf-8")
+
+
+def test_get_file_content_markdown(
+    fastapi_test_client,
+    mocker,
+    file_db_model,
+    setup_file_path_mock,
+):
+    """Test the get_file_content endpoint for markdown files."""
+    file_db_model.extension = "md"
+    file_db_model.display_name = "test.md"
+    file_db_model.magic_mime = "text/markdown"
+
+    mock_get_file_from_db = mocker.patch("api.v1.files.get_file_from_db")
+    mock_get_file_from_db.return_value = file_db_model
+    file_content = "# Hello World\n\nThis is **bold** text."
+    mock_open = mocker.mock_open(read_data=file_content)
+    mocker.patch("builtins.open", mock_open)
+
+    response = fastapi_test_client.get(
+        f"/files/{file_db_model.id}/content?theme=light"
+    )
+
+    assert response.status_code == 200
+    assert "<h1>Hello World</h1>" in response.text
+    assert "This is <strong>bold</strong> text." in response.text
+
+
+def test_get_file_content_markdown_sanitization(
+    fastapi_test_client,
+    mocker,
+    file_db_model,
+    setup_file_path_mock,
+):
+    """Test that get_file_content sanitizes dangerous HTML/Markdown payloads."""
+    file_db_model.extension = "md"
+    file_db_model.display_name = "malicious.md"
+    file_db_model.magic_mime = "text/markdown"
+
+    mock_get_file_from_db = mocker.patch("api.v1.files.get_file_from_db")
+    mock_get_file_from_db.return_value = file_db_model
+    file_content = (
+        "# Title\n\n"
+        "<script>alert('xss');</script>\n"
+        "<style>body { background: red; }</style>\n"
+        "<img src=x onerror=alert(1)>\n"
+        "[Dangerous](javascript:alert(1))"
+    )
+    mock_open = mocker.mock_open(read_data=file_content)
+    mocker.patch("builtins.open", mock_open)
+
+    response = fastapi_test_client.get(
+        f"/files/{file_db_model.id}/content?theme=light"
+    )
+
+    assert response.status_code == 200
+    assert "<h1>Title</h1>" in response.text
+    assert "<script>" not in response.text
+    assert "<style>body" not in response.text
+    assert "onerror" not in response.text
+    assert 'href="javascript:' not in response.text
+
+
+def test_get_file_content_file_not_found(
+    fastapi_test_client, mocker, file_db_model, setup_file_path_mock
+):
+    """Test the get_file_content endpoint when file not found."""
+    expected_path = setup_file_path_mock
+
+    mock_get_file_from_db = mocker.patch("api.v1.files.get_file_from_db")
+    mock_get_file_from_db.return_value = file_db_model
+
+    # Mock open to raise FileNotFoundError for the path returned by the fixture
+    mock_open = mocker.mock_open()
+    mock_open.side_effect = FileNotFoundError
+    mocker.patch("builtins.open", mock_open)
+
+    response = fastapi_test_client.get(f"/files/{file_db_model.id}/content")
+
+    # Use assert_any_call instead of assert_called_once_with to avoid false failures
+    # from internal framework file access.
+    mock_open.assert_any_call(expected_path, "r", encoding="utf-8")
+
+    assert response.status_code == 200
+    assert (
+        '<pre style="color:#000;padding:10px;white-space: pre-wrap; margin: 0; padding: 0;">File not found</pre>'
+        in response.text
+    )
+
+
+@pytest.mark.parametrize(
+    "file_id, display_name", [(1, "file1.txt"), (2, "another_file.pdf")]
+)
+def test_download_file(fastapi_test_client, mocker, file_id, display_name, tmp_path):
+    mock_file_response = mocker.Mock()
+    mock_file_response.id = file_id
+    mock_file_response.display_name = display_name
+    mock_file_response.path = os.path.join(tmp_path, display_name)
+
+    with open(mock_file_response.path, "w") as f:
+        f.write("Dummy file content")
+
+    mock_get_file_from_db = mocker.patch("api.v1.files.get_file_from_db")
+    mock_get_file_from_db.return_value = mock_file_response
+    response = fastapi_test_client.get(f"/files/{file_id}/download")
+    assert response.status_code == 200
+    assert (
+        response.headers["content-disposition"]
+        == f'attachment; filename="{display_name}"'
+    )
+
+
+def test_get_workflows_empty(fastapi_test_client, mocker):
+    """Test the get_workflows endpoint."""
+    mock_get_file_workflows_from_db = mocker.patch(
+        "api.v1.files.get_file_workflows_from_db"
+    )
+    mock_get_file_workflows_from_db.return_value = []
+    file_id = 1
+
+    response = fastapi_test_client.get(f"/files/{file_id}/workflows")
+    assert response.status_code == 200
+
+
+def test_get_workflows(fastapi_test_client, mocker, workflow_response):
+    """Test the get_workflows endpoint."""
+    mock_get_file_workflows_from_db = mocker.patch(
+        "api.v1.files.get_file_workflows_from_db"
+    )
+    mock_get_file_workflows_from_db.return_value = [workflow_response]
+    file_id = 1
+
+    response = fastapi_test_client.get(f"/files/{file_id}/workflows")
+    assert response.status_code == 200
+
+
+def test_generate_file_summary(
+    fastapi_test_client,
+    mocker,
+    file_db_model,
+):
+    """Test generate_file_summary endpoint."""
+    mock_get_active_llm = mocker.patch("api.v1.files.get_active_llm")
+    mock_get_active_llm.return_value = {
+        "name": "test_llm",
+        "config": {"model": "test_model"},
+    }
+    mock_create_file_summary_in_db = mocker.patch(
+        "api.v1.files.create_file_summary_in_db"
+    )
+    mock_background_tasks_add_task = mocker.patch(
+        "api.v1.files.BackgroundTasks.add_task"
+    )
+
+    response = fastapi_test_client.post(f"/files/{file_db_model.id}/summaries")
+    assert response.status_code == 200
+    mock_background_tasks_add_task.assert_called_once()
+    assert (
+        mock_background_tasks_add_task.call_args.args[0].__name__ == "generate_summary"
+    )
+
+
+@pytest.mark.parametrize(
+    "magic_text,expected",
+    [
+        ("SQLite 3.x database, last written using SQLite version 3045001", True),
+        ("DuckDB database file", True),
+        ("sqlite 3.X DATABASE", True),
+        (None, False),
+        ("", False),
+        ("plain text", False),
+        ("ASCII text, mentions sqlite", False),
+        ("Berkeley DB (Hash, version 9, native byte-order) database", False),
+    ],
+)
+def test_is_database_file(magic_text, expected):
+    """Only magic strings naming a SQLite or DuckDB database match."""
+    assert _is_database_file(magic_text) is expected
+
+
+@pytest.mark.parametrize(
+    "magic_text",
+    [
+        "SQLite 3.x database, last written using SQLite version 3045001",
+        "DuckDB database file",
+    ],
+)
+def test_generate_file_summary_database_file(
+    fastapi_test_client, mocker, file_db_model, magic_text
+):
+    """Summaries are refused for SQLite/DuckDB files."""
+    file_db_model.magic_text = magic_text
+    mocker.patch("api.v1.files.get_file_from_db", return_value=file_db_model)
+    mock_get_active_llm = mocker.patch("api.v1.files.get_active_llm")
+    mock_create_file_summary_in_db = mocker.patch(
+        "api.v1.files.create_file_summary_in_db"
+    )
+    mock_add_task = mocker.patch("api.v1.files.BackgroundTasks.add_task")
+
+    response = fastapi_test_client.post(f"/files/{file_db_model.id}/summaries")
+
+    assert response.status_code == 400
+    assert (
+        response.json()["detail"] == "Summaries are not supported for database files."
+    )
+    mock_get_active_llm.assert_not_called()
+    mock_create_file_summary_in_db.assert_not_called()
+    mock_add_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_download_file_stream(
+    fastapi_async_test_client, mocker, file_db_model, setup_file_path_mock
+):
+    """Test the download_file_stream endpoint."""
+    expected_path = setup_file_path_mock
+
+    mock_get_file_from_db = mocker.patch("api.v1.files.get_file_from_db")
+    mock_get_file_from_db.return_value = file_db_model
+
+    # Use the mocked path to create the dummy file. This now works because
+    # setup_file_path_mock ensures the parent directory exists inside tmp_path.
+    with open(expected_path, "w") as f:
+        f.write("Dummy file content")
+
+    response = await fastapi_async_test_client.get(
+        f"/files/{file_db_model.id}/download_stream"
+    )
+    assert response.status_code == 200
+    assert (
+        response.headers["content-disposition"]
+        == f'attachment; filename="{file_db_model.display_name}"'
+    )
+
+    streamed_content = b""
+    async for chunk in response.aiter_bytes():
+        streamed_content += chunk
+    assert streamed_content == b"Dummy file content"
+
+
+@pytest.mark.asyncio
+async def test_upload_files_chunked(
+    fastapi_async_test_client,
+    mocker,
+    folder_db_model,
+    file_db_model,
+    file_response,
+    setup_config_mock,
+):
+    """Test upload_files endpoint with chunked uploads."""
+    mock_config = setup_config_mock
+    temp_storage_path = mock_config["server"]["storage"]["providers"]["default"]["path"]
+
+    # Mock the folder model's path property for the upload endpoint logic
+    # The logic here assumes FolderDBModel is similar to FileDBModel in structure.
+    folder_db_model.storage_provider = "default"
+    # Assuming folders use their UUID as their key when no storage_key is set (or similar logic)
+    folder_db_model.storage_key = f"folder_path_{folder_db_model.id}"
+
+    expected_folder_path = os.path.join(temp_storage_path, folder_db_model.storage_key)
+    os.makedirs(expected_folder_path, exist_ok=True)
+
+    mocker.patch.object(
+        folder_db_model.__class__,
+        "path",
+        new_callable=mocker.PropertyMock,
+        return_value=expected_folder_path,
+    )
+
+    # The legacy mock is now removed
+    # mock_config = mocker.patch("datastores.sql.models.folder.get_config")
+    # storage_path = Path(file_db_model.original_path).parent.parent
+    # mock_config.return_value = {"server": {"storage_path": storage_path}}
+
+    mock_get_folder_from_db = mocker.patch("api.v1.files.get_folder_from_db")
+    mock_get_folder_from_db.return_value = folder_db_model
+    mock_create_file_in_db = mocker.patch("api.v1.files.create_file_in_db")
+    mock_create_file_in_db.return_value = file_response
+    mock_background_tasks_add_task = mocker.patch(
+        "api.v1.files.BackgroundTasks.add_task"
+    )
+    resumable_identifier = "12345"
+    resumable_filename = "test_file.txt"
+    folder_id = folder_db_model.id
+    chunk_size = 1024
+    total_chunks = 3
+    total_size = chunk_size * total_chunks
+    chunk_number = 1
+    current_chunk_size = (
+        chunk_size if chunk_number < total_chunks else total_size % chunk_size
+    )
+
+    chunk_content = b"test file content" * (chunk_size // len(b"test file content"))
+    response = await fastapi_async_test_client.post(
+        "/files/upload",
+        files={"file": ("test_file.txt", chunk_content)},
+        params={
+            "resumableChunkNumber": chunk_number,
+            "resumableChunkSize": chunk_size,
+            "resumableCurrentChunkSize": (
+                current_chunk_size if chunk_number == total_chunks else chunk_size
+            ),
+            "resumableTotalSize": total_size,
+            "resumableTotalChunks": total_chunks,
+            "resumableIdentifier": resumable_identifier,
+            "resumableFilename": resumable_filename,
+            "folder_id": folder_id,
+        },
+    )
+    assert response.status_code == 201
+
+
+def test_get_task(fastapi_test_client, mocker, db, task_response):
+    """Test the get_task endpoint."""
+    mock_get_task_with_access = mocker.patch("api.v1.files.get_task_with_access")
+    mock_get_task_with_access.return_value = task_response
+
+    file_id = 1
+    workflow_id = 1
+    task_id = 1
+    response = fastapi_test_client.get(
+        f"/files/{file_id}/workflows/{workflow_id}/tasks/{task_id}"
+    )
+
+    assert response.status_code == 200
+    mock_get_task_with_access.assert_called_once_with(
+        db, mocker.ANY, task_id, [Role.VIEWER, Role.EDITOR, Role.OWNER], workflow_id=workflow_id
+    )
+
+    assert response.json() == task_response.model_dump(mode="json")
+
+
+def test_get_task_other_workflow(fastapi_test_client, db):
+    """A task can't be fetched through a workflow it isn't part of."""
+    db.get.return_value = SimpleNamespace(id=1, workflow_id=99)
+
+    response = fastapi_test_client.get("/files/1/workflows/1/tasks/1")
+
+    assert response.status_code == 404
+
+
+def test_get_task_no_access(fastapi_test_client, mocker, db):
+    """A task in a folder the user can't access is denied, whatever file is in the URL."""
+    db.get.return_value = SimpleNamespace(
+        id=1, workflow_id=1, workflow=SimpleNamespace(folder=mocker.Mock())
+    )
+    # The URL file is accessible, the task's folder isn't.
+    mocker.patch(
+        "datastores.sql.crud.authz.check_user_access",
+        side_effect=lambda db, user, roles, folder=None, file=None: file is not None,
+    )
+
+    response = fastapi_test_client.get("/files/1/workflows/1/tasks/1")
+
+    assert response.status_code == 403
+
+
+def test_get_file_summary(fastapi_test_client, mocker, db):
+    """Test the get_file_summary endpoint."""
+
+    mock_summary = {
+        "id": 1,
+        "summary": "test summary",
+        "status_short": None,
+        "status_detail": None,
+        "status_progress": None,
+        "runtime": 0.0,
+        "llm_model_prompt": None,
+        "llm_model_provider": None,
+        "llm_model_name": None,
+        "llm_model_config": None,
+        "file_id": 1,
+    }
+    mock_get_file_summary_from_db = mocker.patch(
+        "api.v1.files.get_file_summary_from_db"
+    )
+    mock_get_file_summary_from_db.return_value = SimpleNamespace(**mock_summary)
+
+    file_id = 1
+    summary_id = 1
+
+    response = fastapi_test_client.get(f"/files/{file_id}/summaries/{summary_id}")
+    assert response.status_code == 200
+    assert response.json() == mock_summary
+
+
+def test_get_file_summary_other_file(fastapi_test_client, mocker):
+    """A summary can't be fetched through a file it doesn't belong to."""
+    mocker.patch(
+        "api.v1.files.get_file_summary_from_db",
+        return_value=SimpleNamespace(id=1, file_id=99),
+    )
+
+    response = fastapi_test_client.get("/files/1/summaries/1")
+
+    assert response.status_code == 404
+
+
+def test_download_task_result(fastapi_test_client, mocker, db, tmp_path):
+    """Test the download_task_result endpoint."""
+    file_id = 1
+    workflow_id = 1
+    task_id = 1
+
+    result_file_path = os.path.join(tmp_path, "test_result.txt")
+    with open(result_file_path, "w") as f:
+        f.write("Test result content")
+
+    mock_task = mocker.Mock()
+    mock_task.workflow_id = workflow_id
+    mock_task.result = json.dumps({"output_file_path": result_file_path})
+    db.get.return_value = mock_task
+
+    response = fastapi_test_client.post(
+        f"/files/{file_id}/workflows/{workflow_id}/tasks/{task_id}/download"
+    )
+
+    assert response.status_code == 200
+    assert (
+        response.headers["content-disposition"]
+        == 'attachment; filename="test_result.txt"'
+    )
+    assert response.content == b"Test result content"
+
+
+def test_download_task_result_no_access(fastapi_test_client, mocker, db, tmp_path):
+    """The result of a task in a folder the user can't access isn't returned."""
+    result_file_path = os.path.join(tmp_path, "secret.txt")
+    with open(result_file_path, "w") as f:
+        f.write("secret")
+    mock_task = mocker.Mock()
+    mock_task.workflow_id = 1
+    mock_task.result = json.dumps({"output_file_path": result_file_path})
+    db.get.return_value = mock_task
+    # The URL file is accessible, the task's folder isn't.
+    mocker.patch(
+        "datastores.sql.crud.authz.check_user_access",
+        side_effect=lambda db, user, roles, folder=None, file=None: file is not None,
+    )
+
+    response = fastapi_test_client.post("/files/1/workflows/1/tasks/1/download")
+
+    assert response.status_code == 403
+    assert b"secret" not in response.content
+
+
+@pytest.mark.parametrize(
+    "method,path,payload",
+    [
+        ("get", "/files/1/sql/schemas", None),
+        ("post", "/files/1/sql/query", {"query": "SELECT * FROM t LIMIT 1;"}),
+        ("post", "/files/1/sql/query/generate", {"user_request": "all rows"}),
+    ],
+)
+def test_sql_endpoints_disabled(fastapi_test_client, mocker, method, path, payload):
+    """SQL endpoints are disabled and never touch the file."""
+    mock_get_file_from_db = mocker.patch("api.v1.files.get_file_from_db")
+    kwargs = {"json": payload} if payload is not None else {}
+
+    response = getattr(fastapi_test_client, method)(path, **kwargs)
+
+    assert response.status_code == 410
+    assert response.json()["detail"] == "SQL querying of files has been disabled."
+    mock_get_file_from_db.assert_not_called()
+
+
+def test_sql_endpoints_openapi(fastapi_test_client):
+    """Disabled SQL endpoints are documented as deprecated and 410 only."""
+    paths = fastapi_test_client.app.openapi()["paths"]
+    for path, method in [
+        ("/files/{file_id}/sql/schemas", "get"),
+        ("/files/{file_id}/sql/query", "post"),
+        ("/files/{file_id}/sql/query/generate", "post"),
+    ]:
+        operation = paths[path][method]
+        assert operation["deprecated"] is True
+        assert set(operation["responses"]) - {"422"} == {"410"}
+        assert operation["responses"]["410"]["description"] == (
+            "SQL querying of files has been disabled."
+        )
+
+
+def test_get_file_content_encoding_fallback(
+    fastapi_test_client, mocker, file_db_model, setup_file_path_mock
+):
+    """Test get_file_content falls back to other encodings."""
+    expected_path = setup_file_path_mock
+    mock_get_file_from_db = mocker.patch("api.v1.files.get_file_from_db")
+    mock_get_file_from_db.return_value = file_db_model
+
+    def side_effect(path, mode, encoding=None):
+        if encoding == "utf-8":
+            raise UnicodeDecodeError("utf-8", b"", 0, 1, "")
+        # Mocking a file handle that returns content on read
+        m = mocker.mock_open(read_data="Fallback content").return_value
+        return m
+
+    mocker.patch("builtins.open", side_effect=side_effect)
+
+    response = fastapi_test_client.get(f"/files/{file_db_model.id}/content")
+    assert response.status_code == 200
+    assert "Fallback content" in response.text
+
+
+def test_get_file_content_unescaped(
+    fastapi_test_client, mocker, file_db_model, setup_file_path_mock
+):
+    """Test get_file_content with unescaped content."""
+    expected_path = setup_file_path_mock
+    mock_get_file_from_db = mocker.patch("api.v1.files.get_file_from_db")
+    file_db_model.data_type = "text/html"
+    mock_get_file_from_db.return_value = file_db_model
+
+    mocker.patch("api.v1.files.ALLOWED_DATA_TYPES_PREVIEW", ["text/html"])
+
+    file_content = "<b>Bold Content</b>"
+    mock_open = mocker.mock_open(read_data=file_content)
+    mocker.patch("builtins.open", mock_open)
+
+    response = fastapi_test_client.get(
+        f"/files/{file_db_model.id}/content?unescaped=True"
+    )
+    assert response.status_code == 200
+    assert file_content in response.text
+
+
+@pytest.mark.asyncio
+async def test_upload_files_complete(
+    fastapi_async_test_client,
+    mocker,
+    folder_db_model,
+    file_db_model,
+    file_response,
+    setup_config_mock,
+):
+    """Test upload_files endpoint when all chunks are uploaded."""
+    mock_config = setup_config_mock
+    temp_storage_path = mock_config["server"]["storage"]["providers"]["default"]["path"]
+
+    folder_db_model.storage_provider = "default"
+    folder_db_model.storage_key = f"folder_path_{folder_db_model.id}"
+
+    expected_folder_path = os.path.join(temp_storage_path, folder_db_model.storage_key)
+    os.makedirs(expected_folder_path, exist_ok=True)
+
+    mocker.patch.object(
+        folder_db_model.__class__,
+        "path",
+        new_callable=mocker.PropertyMock,
+        return_value=expected_folder_path,
+    )
+
+    mock_get_folder_from_db = mocker.patch("api.v1.files.get_folder_from_db")
+    mock_get_folder_from_db.return_value = folder_db_model
+    mock_create_file_in_db = mocker.patch("api.v1.files.create_file_in_db")
+    mock_create_file_in_db.return_value = file_response
+    mock_background_tasks_add_task = mocker.patch(
+        "api.v1.files.BackgroundTasks.add_task"
+    )
+
+    # Mock Redis
+    mock_redis = mocker.patch("api.v1.files.redis_client")
+    mock_redis.smembers.return_value = {b"1", b"2", b"3"}
+
+    resumable_identifier = "12345"
+    resumable_filename = "test_file.txt"
+    folder_id = folder_db_model.id
+    chunk_size = 1024
+    total_chunks = 3
+    total_size = chunk_size * total_chunks
+    chunk_number = 3
+
+    # Create dummy chunk files
+    for i in range(1, total_chunks + 1):
+        chunk_path = os.path.join(expected_folder_path, f"{resumable_identifier}.{i}")
+        with open(chunk_path, "w") as f:
+            f.write(f"content of chunk {i}")
+
+    response = await fastapi_async_test_client.post(
+        "/files/upload",
+        files={"file": ("test_file.txt", b"last chunk content")},
+        params={
+            "resumableChunkNumber": chunk_number,
+            "resumableChunkSize": chunk_size,
+            "resumableCurrentChunkSize": chunk_size,
+            "resumableTotalSize": total_size,
+            "resumableTotalChunks": total_chunks,
+            "resumableIdentifier": resumable_identifier,
+            "resumableFilename": resumable_filename,
+            "folder_id": folder_id,
+        },
+    )
+    assert response.status_code == 201
+    assert mock_create_file_in_db.called
+    assert mock_background_tasks_add_task.called
+
+
+def test_generate_file_summary_no_llm(fastapi_test_client, mocker, file_db_model):
+    """Test generate_file_summary endpoint when no active LLM."""
+    mock_get_active_llm = mocker.patch("api.v1.files.get_active_llm")
+    mock_get_active_llm.return_value = None  # No active LLM
+    mock_get_file_from_db = mocker.patch("api.v1.files.get_file_from_db")
+    mock_get_file_from_db.return_value = file_db_model
+
+    response = fastapi_test_client.post(f"/files/{file_db_model.id}/summaries")
+    assert response.status_code == 503
+    assert response.json()["detail"] == "No active LLM available."
+
+
+def test_get_file_chat_history_empty(fastapi_test_client, mocker):
+    """Test get_file_chat_history when no chat exists."""
+    mock_get_latest_file_chat_from_db = mocker.patch(
+        "api.v1.files.get_latest_file_chat_from_db"
+    )
+    mock_get_latest_file_chat_from_db.return_value = None
+    file_id = 1
+
+    response = fastapi_test_client.get(f"/files/{file_id}/chat/history")
+    assert response.status_code == 200
+    assert response.json() == {
+        "title": None,
+        "history": [],
+        "created_at": None,
+        "deleted_at": None,
+        "id": None,
+        "is_deleted": False,
+        "updated_at": None,
+    }
+
+
+def test_get_file_chat_history_with_data(fastapi_test_client, mocker):
+    """Test get_file_chat_history when chat exists."""
+    mock_chat = mocker.Mock()
+    mock_chat.title = "Test Chat"
+    mock_chat.get_chat_history.return_value = [{"role": "user", "content": "hello"}]
+
+    mock_get_latest_file_chat_from_db = mocker.patch(
+        "api.v1.files.get_latest_file_chat_from_db"
+    )
+    mock_get_latest_file_chat_from_db.return_value = mock_chat
+    file_id = 1
+
+    response = fastapi_test_client.get(f"/files/{file_id}/chat/history")
+    assert response.status_code == 200
+    assert response.json() == {
+        "title": "Test Chat",
+        "history": [{"role": "user", "content": "hello"}],
+        "created_at": None,
+        "deleted_at": None,
+        "id": None,
+        "is_deleted": False,
+        "updated_at": None,
+    }
+
+
+def test_create_file_chat_message_no_llm(fastapi_test_client, mocker):
+    """Test create_file_chat_message when no LLM available."""
+    mock_get_latest_file_chat_from_db = mocker.patch(
+        "api.v1.files.get_latest_file_chat_from_db"
+    )
+    mock_get_latest_file_chat_from_db.return_value = mocker.Mock()  # Assume chat exists
+
+    mock_get_active_llm = mocker.patch("api.v1.files.get_active_llm")
+    mock_get_active_llm.return_value = None  # No active LLM
+
+    file_id = 1
+    response = fastapi_test_client.post(
+        f"/files/{file_id}/chat", json={"prompt": "hello"}
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "No active LLM available."
+
+
+@pytest.mark.asyncio
+async def test_create_file_chat_message_success(fastapi_async_test_client, mocker):
+    """Test create_file_chat_message success."""
+    mock_chat_obj = mocker.Mock()
+    mock_chat_obj.id = 1
+    mock_chat_obj.get_chat_history.return_value = []
+
+    mock_get_latest_file_chat_from_db = mocker.patch(
+        "api.v1.files.get_latest_file_chat_from_db"
+    )
+    mock_get_latest_file_chat_from_db.return_value = mock_chat_obj
+
+    mock_get_active_llm = mocker.patch("api.v1.files.get_active_llm")
+    mock_get_active_llm.return_value = {
+        "name": "test_llm",
+        "config": {"model": "test_model"},
+    }
+
+    mock_chat_session = mocker.Mock()
+    mock_chat_session.chat.return_value = "This is the LLM response"
+    mock_create_chat_session = mocker.patch("api.v1.files.create_chat_session")
+    mock_create_chat_session.return_value = mock_chat_session
+
+    mock_create_file_chat_message_in_db = mocker.patch(
+        "api.v1.files.create_file_chat_message_in_db"
+    )
+
+    file_id = 1
+    response = await fastapi_async_test_client.post(
+        f"/files/{file_id}/chat", json={"prompt": "hello"}
+    )
+
+    assert response.status_code == 200
+
+    # Read from stream
+    content = b""
+    async for chunk in response.aiter_bytes():
+        content += chunk
+
+    assert b"This is the LLM response" in content
+    assert mock_create_file_chat_message_in_db.called
+
+
+def test_get_file_invalid_id_format(fastapi_test_client):
+    """Test get_file with non-integer file ID format (e.g. 'None')."""
+    response = fastapi_test_client.get("/files/None")
+    assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "identifier", ["../escaped", "a/b", "..", "a.b", "/tmp/x", "a\\b", "", "x" * 129]
+)
+async def test_upload_files_rejects_unsafe_identifier(
+    fastapi_async_test_client, mocker, tmp_path, identifier
+):
+    """The upload identifier can't be used to write or delete files outside the folder."""
+    folder_path = tmp_path / "folder"
+    folder_path.mkdir()
+    mocker.patch(
+        "api.v1.files.get_folder_from_db", return_value=SimpleNamespace(path=str(folder_path))
+    )
+    mock_redis = mocker.patch("api.v1.files.redis_client")
+
+    response = await fastapi_async_test_client.post(
+        "/files/upload",
+        files={"file": ("test_file.txt", b"payload")},
+        params={
+            "resumableChunkNumber": 1,
+            "resumableTotalChunks": 1,
+            "resumableIdentifier": identifier,
+            "resumableFilename": "test_file.txt",
+            "folder_id": 1,
+        },
+    )
+
+    assert response.status_code in (400, 422)
+    assert mock_redis.method_calls == []
+    assert list(tmp_path.rglob("*")) == [folder_path]

@@ -1,0 +1,691 @@
+# Copyright 2024 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import glob
+import html
+import json
+import os
+import re
+from datetime import datetime
+from typing import List
+from uuid import uuid4
+
+import markdown
+import nh3
+import aiofiles
+import redis
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from sqlalchemy.orm import Session
+
+from auth.common import get_current_active_user
+from config import config, get_active_llm
+from datastores.sql.crud.authz import get_task_with_access, require_access
+from datastores.sql.crud.file import (
+    create_file_chat_in_db,
+    create_file_chat_message_in_db,
+    create_file_in_db,
+    create_file_summary_in_db,
+    delete_file_from_db,
+    get_file_from_db,
+    get_file_summary_from_db,
+    get_latest_file_chat_from_db,
+)
+from datastores.sql.crud.folder import get_folder_from_db
+from datastores.sql.crud.workflow import get_file_workflows_from_db
+from datastores.sql.database import get_db_connection
+from datastores.sql.models.role import Role
+from lib.file_hashes import generate_hashes
+from lib.llm_file_chat import BASE_SYSTEM_INSTRUCTIONS, create_chat_session
+from lib.llm_summary import generate_summary
+
+from openrelik_common import telemetry
+
+from . import schemas
+
+router = APIRouter()
+
+# Upload identifiers from clients are UUIDs or hex strings.
+UPLOAD_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
+
+def _is_database_file(magic_text: str | None) -> bool:
+    """Return True if the file magic identifies a SQLite or DuckDB database."""
+    if not magic_text:
+        return False
+    magic_text_lower = magic_text.lower()
+    return "database" in magic_text_lower and (
+        "sqlite" in magic_text_lower or "duckdb" in magic_text_lower
+    )
+
+
+# File types that are trusted to be returned unescaped to the client
+ALLOWED_DATA_TYPES_PREVIEW = config.get("ui", {}).get("allowed_data_types_preview", [])
+
+REDIS_URL = os.getenv("REDIS_URL")
+redis_client = redis.Redis.from_url(REDIS_URL)
+
+
+# Get file
+# TODO: Return different response if folder is deleted.
+@router.get("/{file_id}")
+@require_access(allowed_roles=[Role.VIEWER, Role.EDITOR, Role.OWNER])
+def get_file(
+    file_id: str,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+) -> schemas.FileResponse:
+    """Get a file's metadata from the database."""
+    telemetry.add_attribute_to_current_span('file_id', file_id)
+    return get_file_from_db(db, int(file_id))
+
+
+def sanitize_html(html_content: str) -> str:
+    """Sanitizes HTML content using nh3."""
+    return nh3.clean(
+        html_content,
+        tags={
+            "p", "div", "span", "br", "hr",
+            "h1", "h2", "h3", "h4", "h5", "h6",
+            "strong", "em", "b", "i", "code", "pre", "blockquote",
+            "ul", "ol", "li",
+            "table", "thead", "tbody", "tr", "th", "td",
+            "a", "img",
+        },
+        attributes={
+            "a": {"href", "title", "target"},
+            "img": {"src", "alt", "title"},
+            "code": {"class"},
+            "div": {"class"},
+        },
+        url_schemes={"http", "https", "mailto"},
+        link_rel="noopener noreferrer nofollow",
+    )
+
+
+# Get file content
+@router.get("/{file_id}/content", response_class=HTMLResponse)
+@require_access(allowed_roles=[Role.VIEWER, Role.EDITOR, Role.OWNER])
+def get_file_content(
+    file_id: str,
+    theme: str = "light",
+    unescaped: bool = False,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+) -> HTMLResponse:
+    """Returns an HTML response with the file's content."""
+    telemetry.add_attribute_to_current_span('file_id', file_id)
+    file = get_file_from_db(db, file_id)
+    encodings_to_try = ["utf-8", "utf-16", "ISO-8859-1"]
+
+    for encoding in encodings_to_try:
+        try:
+            with open(file.path, "r", encoding=encoding) as fh:
+                content = fh.read()
+                break
+        except FileNotFoundError:
+            content = "File not found"
+        except UnicodeDecodeError:
+            continue
+    background_color = "#fff"
+    font_color = "#000"
+    border_color = "#d0d7de"
+    code_bg = "#f6f8fa"
+    table_header_bg = "#f6f8fa"
+    scrollbar_track_color = "#fff"
+    scrollbar_thumb_color = "#ddd"
+
+    if theme == "dark":
+        background_color = "#0e172a"
+        font_color = "#fff"
+        border_color = "#30363d"
+        code_bg = "#161b22"
+        table_header_bg = "#161b22"
+        scrollbar_track_color = "#000"
+        scrollbar_thumb_color = "#333"
+
+    is_markdown = (
+        (file.extension and file.extension.lower() in ["md", "markdown"])
+        or (file.display_name and file.display_name.lower().endswith((".md", ".markdown")))
+        or (file.magic_mime and file.magic_mime.lower() in ["text/markdown", "text/x-markdown"])
+    )
+
+    csp_nonce = uuid4().hex
+
+    if is_markdown:
+        raw_md = markdown.markdown(
+            content,
+            extensions=["tables", "fenced_code", "nl2br", "sane_lists"]
+        )
+        rendered_md = sanitize_html(raw_md)
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+            <head>
+                <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-{csp_nonce}'; script-src 'none'; img-src data: http: https:; object-src 'none'; frame-src 'none';">
+                <base target="_blank" rel="noopener noreferrer">
+                <style nonce="{csp_nonce}">
+                    html {{
+                        background: {background_color};
+                        scrollbar-color: {scrollbar_thumb_color} {scrollbar_track_color};
+                    }}
+                    body {{
+                        margin: 0;
+                        padding: 16px;
+                        background: {background_color};
+                        color: {font_color};
+                        font-family: sans-serif;
+                    }}
+                    .markdown-body table {{
+                        border-collapse: collapse;
+                        width: 100%;
+                        margin-bottom: 16px;
+                    }}
+                    .markdown-body table th, .markdown-body table td {{
+                        padding: 6px 13px;
+                        border: 1px solid {border_color};
+                    }}
+                    .markdown-body table th {{
+                        font-weight: 600;
+                        background-color: {table_header_bg};
+                    }}
+                    .markdown-body ul, .markdown-body ol {{
+                        padding-left: 2em;
+                        margin-bottom: 16px;
+                    }}
+                    .markdown-body blockquote {{
+                        padding: 0 1em;
+                        margin: 0 0 16px 0;
+                        border-left: 4px solid {border_color};
+                        opacity: 0.85;
+                    }}
+                    .markdown-body code {{
+                        font-family: monospace;
+                        background-color: {code_bg};
+                        padding: 0.2em 0.4em;
+                        border-radius: 4px;
+                    }}
+                    .markdown-body pre {{
+                        background-color: {code_bg};
+                        padding: 12px;
+                        border-radius: 6px;
+                        overflow-x: auto;
+                        margin: 0 0 16px 0;
+                    }}
+                    .markdown-body pre code {{
+                        background: transparent;
+                        padding: 0;
+                    }}
+                </style>
+            </head>
+            <body>
+                <div class="markdown-body">
+                    {rendered_md}
+                </div>
+            </body>
+        </html>
+        """
+    else:
+        html_source_content = html.escape(content)
+        if unescaped:
+            if file.data_type in ALLOWED_DATA_TYPES_PREVIEW:
+                html_source_content = sanitize_html(content)
+
+        html_content = f"""
+        <html style="background:{background_color}; scrollbar-color: {scrollbar_thumb_color} {scrollbar_track_color};">
+            <body style="margin: 0;">
+                <pre style="color:{font_color};padding:10px;white-space: pre-wrap; margin: 0; padding: 0;">{html_source_content}</pre>
+            </body>
+        </html>
+        """
+    return HTMLResponse(content=html_content, status_code=200)
+
+
+# Download file
+@router.get("/{file_id}/download")
+@require_access(allowed_roles=[Role.VIEWER, Role.EDITOR, Role.OWNER])
+def download_file(
+    file_id: int,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+) -> FileResponse:
+    """Downloads a file's contents based on its ID."""
+    telemetry.add_attribute_to_current_span('file_id', file_id)
+    file = get_file_from_db(db, file_id)
+    headers = {"Access-Control-Expose-Headers": "Content-Disposition"}
+    return FileResponse(
+        path=file.path,
+        filename=file.display_name,
+        media_type="application/octet-stream",
+        headers=headers,
+    )
+
+
+# Download file stream
+@router.get("/{file_id}/download_stream")
+@require_access(allowed_roles=[Role.VIEWER, Role.EDITOR, Role.OWNER])
+async def download_file_stream(
+    file_id: int,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+):
+    """Downloads a file using streaming."""
+    telemetry.add_attribute_to_current_span('file_id', file_id)
+    file = get_file_from_db(db, file_id)
+    file_path = file.path
+    CHUNK_SIZE = 10 * 1024 * 1024  # 10MB
+
+    async def iterfile():
+        async with aiofiles.open(file_path, "rb") as f:
+            while chunk := await f.read(CHUNK_SIZE):
+                yield chunk
+
+    headers = {
+        "Access-Control-Expose-Headers": "Content-Disposition",
+        "Content-Disposition": f'attachment; filename="{file.display_name}"',
+        "Content-Length": str(file.filesize),
+    }
+
+    return StreamingResponse(iterfile(), headers=headers, media_type="application/octet-stream")
+
+
+# Delete file
+@router.delete("/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
+@require_access(allowed_roles=[Role.OWNER])
+def delete_file(
+    file_id: int,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+):
+    telemetry.add_attribute_to_current_span('file_id', file_id)
+    delete_file_from_db(db, file_id)
+
+
+# Upload file
+@router.post("/upload", status_code=status.HTTP_201_CREATED)
+@require_access(allowed_roles=[Role.EDITOR, Role.OWNER])
+async def upload_files(
+    file: UploadFile = File(...),
+    resumableChunkNumber: int = Query(...),
+    resumableChunkSize: int | None = None,
+    resumableCurrentChunkSize: int | None = None,
+    resumableTotalChunks: int = Query(...),
+    resumableTotalSize: int | None = None,
+    resumableIdentifier: str = Query(...),
+    resumableFilename: str = Query(...),
+    resumableRelativePath: str | None = None,
+    folder_id: int = Query(...),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+):
+    """Uploads a file to the server.
+
+    Returns:
+        File: File metadata.
+    """
+
+    def _remove_chunks(chunks_to_remove: set) -> None:
+        """Remove chunk files from disk.
+
+        Args:
+            chunks_to_remove (set): Set of chunk file paths to remove.
+        """
+        for chunk_path in chunks_to_remove:
+            try:
+                os.remove(chunk_path)
+            except FileNotFoundError:
+                pass
+
+    MAX_CHUNK_RETRIES = 5
+
+    # The identifier is part of the chunk file paths, so it must not be able to leave the folder.
+    if not UPLOAD_IDENTIFIER_PATTERN.fullmatch(resumableIdentifier):
+        raise HTTPException(status_code=400, detail="Invalid upload identifier.")
+
+    # The folder that the file will be saved to.
+    folder = get_folder_from_db(db, folder_id)
+
+    # We need to keep state between requests to track the status of the uploaded chunks.
+    # The resumableIdentifier is used to identify the upload session for a specific file.
+    # The resumableChunkNumber is used to identify the chunk being uploaded.
+    redis_uploaded_chunks_key = f"uploaded_chunks:{resumableIdentifier}"
+    redis_upload_retries_key = f"upload_retries:{resumableIdentifier}:{resumableChunkNumber}"
+
+    # Construct the chunk file path
+    chunk_file_path = os.path.join(folder.path, f"{resumableIdentifier}.{resumableChunkNumber}")
+
+    # If the chunk has been retried more than MAX_CHUNK_RETRIES times, remove all chunks and return
+    # a 429 error to signal to the client to stop retrying uploading the chunk.
+    retry_count = redis_client.get(redis_upload_retries_key)
+    if retry_count and int(retry_count) >= MAX_CHUNK_RETRIES:
+        chunk_pattern = os.path.join(folder.path, f"{resumableIdentifier}.*")
+        chunks_to_remove = set(glob.glob(chunk_pattern))
+        _remove_chunks(chunks_to_remove)
+        redis_client.delete(redis_uploaded_chunks_key)
+        redis_client.delete(redis_upload_retries_key)
+        raise HTTPException(status_code=429, detail="Failed to upload file")
+
+    # Save the chunk to disk. If the chunk fails to save return a 503 error to signal to the client
+    # to retry the chunk.
+    try:
+        async with aiofiles.open(chunk_file_path, "wb") as fh:
+            while content := await file.read(4096000):  # Read 4MB chunks
+                await fh.write(content)
+                redis_client.sadd(redis_uploaded_chunks_key, resumableChunkNumber)
+    except Exception:
+        redis_client.incr(redis_upload_retries_key, 1)
+        raise HTTPException(status_code=503, detail="Failed to write chunk to disk")
+
+    # Check if all chunks have been uploaded
+    all_chunks_uploaded = (
+        len(redis_client.smembers(redis_uploaded_chunks_key)) == resumableTotalChunks
+    )
+
+    # If not all chunks have been uploaded, return a 200 OK response to let the client know to
+    # continue retrying uploading.
+    if not all_chunks_uploaded:
+        return
+
+    # If all chunks have been successfully uploaded, remove the redis state keys.
+    redis_client.delete(redis_uploaded_chunks_key)
+    redis_client.delete(redis_upload_retries_key)
+
+    # If all chunks has been uploaded then assemble the complete file.
+    _, file_extension = os.path.splitext(resumableFilename)
+    uuid = uuid4()
+    output_filename = f"{uuid.hex}{file_extension}"
+    output_path = os.path.join(folder.path, output_filename)
+
+    chunks_to_remove = set()
+    try:
+        async with aiofiles.open(output_path, "wb") as outfile:
+            for chunk_number in range(1, resumableTotalChunks + 1):
+                chunk_path = os.path.join(folder.path, f"{resumableIdentifier}.{chunk_number}")
+                async with aiofiles.open(chunk_path, "rb") as infile:
+                    while content := await infile.read(1024000):  # Read 1MB chunks
+                        await outfile.write(content)
+                chunks_to_remove.add(chunk_path)
+    except Exception:
+        # If there is any error while writing the file, remove all chunks and return a 500 error.
+        _remove_chunks(chunks_to_remove)
+        raise HTTPException(status_code=500, detail="Failed to write file to disk")
+
+    # Remove all temporary chunk files
+    _remove_chunks(chunks_to_remove)
+
+    # Save to database
+    new_file = schemas.FileCreate(
+        display_name=resumableFilename,
+        uuid=uuid,
+        filename=resumableFilename,
+        extension=file_extension.lstrip("."),
+        user_id=current_user.id,
+    )
+
+    if folder_id != "null":
+        new_file.folder_id = int(folder_id)
+
+    new_file_db = create_file_in_db(db, new_file, current_user)
+    background_tasks.add_task(generate_hashes, file_id=new_file_db.id)
+
+    return new_file_db
+
+
+# Get all workflows for a file
+@router.get(
+    "/{file_id}/workflows",
+    summary="Get all workflows for a file",
+)
+@require_access(allowed_roles=[Role.VIEWER, Role.EDITOR, Role.OWNER])
+def get_workflows(
+    file_id: str,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+) -> List[schemas.WorkflowResponse]:
+    telemetry.add_attribute_to_current_span('file_id', file_id)
+    return get_file_workflows_from_db(db, file_id)
+
+
+# Get task
+@router.get("/{file_id}/workflows/{workflow_id}/tasks/{task_id}")
+@require_access(allowed_roles=[Role.VIEWER, Role.EDITOR, Role.OWNER])
+def get_task(
+    file_id: int,
+    workflow_id: int,
+    task_id: int,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+) -> schemas.TaskResponse:
+    telemetry.add_attribute_to_current_span('file_id', file_id)
+    telemetry.add_attribute_to_current_span('workflow_id', workflow_id)
+    telemetry.add_attribute_to_current_span('task_id', task_id)
+    return get_task_with_access(
+        db, current_user, task_id, [Role.VIEWER, Role.EDITOR, Role.OWNER], workflow_id=workflow_id
+    )
+
+
+# Download task result file
+@router.post("/{file_id}/workflows/{workflow_id}/tasks/{task_id}/download")
+@require_access(allowed_roles=[Role.VIEWER, Role.EDITOR, Role.OWNER])
+def download_task_result(
+    file_id: int,
+    workflow_id: int,
+    task_id: int,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+) -> FileResponse:
+    """Downloads a task result file based on its ID."""
+    telemetry.add_attribute_to_current_span('file_id', file_id)
+    telemetry.add_attribute_to_current_span('workflow_id', workflow_id)
+    telemetry.add_attribute_to_current_span('task_id', task_id)
+    task = get_task_with_access(
+        db, current_user, task_id, [Role.VIEWER, Role.EDITOR, Role.OWNER], workflow_id=workflow_id
+    )
+    result = json.loads(task.result) if task.result else {}
+    result_file_path = result.get("output_file_path") if isinstance(result, dict) else None
+    if not result_file_path or not os.path.isfile(result_file_path):
+        raise HTTPException(status_code=404, detail="Task result file not found.")
+    filename = os.path.basename(result_file_path)
+
+    headers = {"Access-Control-Expose-Headers": "Content-Disposition"}
+    return FileResponse(
+        path=result_file_path,
+        filename=filename,
+        media_type="application/octet-stream",
+        headers=headers,
+    )
+
+
+@router.get("/{file_id}/summaries/{summary_id}", response_model=schemas.FileSummaryResponse)
+@require_access(allowed_roles=[Role.VIEWER, Role.EDITOR, Role.OWNER])
+def get_file_summary(
+    file_id: int,
+    summary_id: int,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+):
+    telemetry.add_attribute_to_current_span('file_id', file_id)
+    telemetry.add_attribute_to_current_span('summary_id', summary_id)
+    summary = get_file_summary_from_db(db, summary_id)
+    # The decorator checked access to file_id, so the summary must belong to that file.
+    if not summary or summary.file_id != file_id:
+        raise HTTPException(status_code=404, detail="Summary not found.")
+    return summary
+
+
+@router.post("/{file_id}/summaries")
+@require_access(allowed_roles=[Role.VIEWER, Role.EDITOR, Role.OWNER])
+def generate_file_summary(
+    file_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+):
+    telemetry.add_attribute_to_current_span('file_id', file_id)
+    file = get_file_from_db(db, file_id)
+    if _is_database_file(file.magic_text):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Summaries are not supported for database files.",
+        )
+    active_llm = get_active_llm()
+    if not active_llm:
+        raise HTTPException(
+            status_code=503,
+            detail="No active LLM available.",
+        )
+
+    new_file_summary = schemas.FileSummaryCreate(
+        status_short="in_progress",
+        file_id=file_id,
+    )
+    file_summary_db = create_file_summary_in_db(db, new_file_summary)
+
+    background_tasks.add_task(
+        generate_summary,
+        llm_provider=active_llm["name"],
+        llm_model=active_llm["config"]["model"],
+        file_id=file_id,
+        file_summary_id=file_summary_db.id,
+    )
+
+
+@router.get("/{file_id}/chat/history")
+@require_access(allowed_roles=[Role.VIEWER, Role.EDITOR, Role.OWNER])
+def get_file_chat_history(
+    file_id: int,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+) -> schemas.FileChatResponse:
+    """Get the latest file chat for a given file ID."""
+    telemetry.add_attribute_to_current_span('file_id', file_id)
+    chat = get_latest_file_chat_from_db(
+        db=db,
+        file_id=file_id,
+        user_id=current_user.id,
+    )
+    return schemas.FileChatResponse(
+        title=chat.title if chat else None,
+        history=chat.get_chat_history() if chat else [],
+    )
+
+
+@router.post("/{file_id}/chat", response_class=StreamingResponse)
+@require_access(allowed_roles=[Role.VIEWER, Role.EDITOR, Role.OWNER])
+def create_file_chat_message(
+    file_id: int,
+    request: schemas.FileChatRequest,
+    db: Session = Depends(get_db_connection),
+    current_user: schemas.User = Depends(get_current_active_user),
+):
+    """Chat about a file using Server-Sent Events (SSE)."""
+    telemetry.add_attribute_to_current_span('file_id', file_id)
+    file_chat = get_latest_file_chat_from_db(
+        db=db,
+        file_id=file_id,
+        user_id=current_user.id,
+    )
+    telemetry.add_attribute_to_current_span('user_id', current_user.id)
+
+    if not file_chat:
+        file_chat_schema = schemas.FileChatCreate(
+            system_instructions=BASE_SYSTEM_INSTRUCTIONS,
+            user_id=current_user.id,
+            file_id=file_id,
+        )
+        file_chat = create_file_chat_in_db(db=db, file_chat=file_chat_schema)
+
+    history = file_chat.get_chat_history()
+    active_llm = get_active_llm()
+
+    if not active_llm:
+        raise HTTPException(
+            status_code=503,
+            detail="No active LLM available.",
+        )
+
+    llm_provider = active_llm["name"]
+    llm_model = active_llm["config"]["model"]
+    chat_session = create_chat_session(llm_provider, llm_model, file_id, history)
+
+    def event_generator():
+        start_time = datetime.now()
+        try:
+            # Synchronous LLM call
+            response_text = chat_session.chat(request.prompt)
+
+            end_time = datetime.now()
+            duration = end_time - start_time
+
+            # Save the message independently
+            file_chat_message = schemas.FileChatMessageCreate(
+                file_chat_id=file_chat.id,
+                request_prompt=request.prompt,
+                response_text=response_text,
+                runtime=duration.seconds,
+            )
+            create_file_chat_message_in_db(db=db, file_chat_message=file_chat_message)
+
+            # Yield content block properly formatted for SSE
+            lines = response_text.split("\n")
+            data_payload = "\ndata: ".join(lines)
+            yield f"data: {data_payload}\n\n"
+
+        except Exception as e:
+            yield f"event: error\ndata: {str(e)}\n\n"
+        finally:
+            yield "event: close\ndata: \n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+SQL_QUERY_DISABLED_DETAIL = "SQL querying of files has been disabled."
+SQL_QUERY_DISABLED_ROUTE_ARGS = {
+    "status_code": status.HTTP_410_GONE,
+    "deprecated": True,
+    "responses": {status.HTTP_410_GONE: {"description": SQL_QUERY_DISABLED_DETAIL}},
+}
+
+
+@router.post("/{file_id}/sql/query", **SQL_QUERY_DISABLED_ROUTE_ARGS)
+def run_sql_query(file_id: int):
+    """Disabled. Querying files with DuckDB is no longer supported."""
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE, detail=SQL_QUERY_DISABLED_DETAIL
+    )
+
+
+@router.post("/{file_id}/sql/query/generate", **SQL_QUERY_DISABLED_ROUTE_ARGS)
+def generate_query(file_id: int):
+    """Disabled. Querying files with DuckDB is no longer supported."""
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE, detail=SQL_QUERY_DISABLED_DETAIL
+    )
+
+
+@router.get("/{file_id}/sql/schemas", **SQL_QUERY_DISABLED_ROUTE_ARGS)
+def get_all_tables_schemas(file_id: int):
+    """Disabled. Querying files with DuckDB is no longer supported."""
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE, detail=SQL_QUERY_DISABLED_DETAIL
+    )
