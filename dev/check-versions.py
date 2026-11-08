@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check that the versions in the repository follow the versioning rules.
 
-Usage: scripts/check-versions   (from anywhere in the repository; Python 3.11+)
+Usage: dev/check-versions.py   (from anywhere in the repository; Python 3.11+)
 
 VERSION at the root is the platform version; on main it carries a dev suffix
 (0.18.0.dev0, written 0.18.0-dev in package.json). The rules:
