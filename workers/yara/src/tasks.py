@@ -387,8 +387,8 @@ def command(
                 try:
                     send_progress(self, "Mounting disk image", display_name)
                     bd = BlockDevice(input_file_path, min_partition_size=1)
-                    bd.setup()
                     disks_mounted.append(bd)
+                    bd.setup()
                     mountpoints = bd.mount()
                     send_progress(
                         self,
@@ -405,8 +405,8 @@ def command(
                     skipped_inputs.append(
                         SkippedInput(
                             display_name,
-                            "Disk image input is not supported or could not be "
-                            "mounted by the Yara worker.",
+                            "Disk image input could not be mounted by the "
+                            f"Yara worker: {e}",
                         )
                     )
                     continue
